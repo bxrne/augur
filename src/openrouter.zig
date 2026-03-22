@@ -20,7 +20,7 @@ pub fn fetchCompletion(
         .tools = &[_]types.Tool{types.Tool{
             .type = "function",
             .function = .{
-                .name = "Read",
+                .name = "read",
                 .description = "Read and return the contents of a file",
                 .parameters = .{
                     .type = "object",
@@ -76,9 +76,14 @@ pub fn fetchCompletion(
             const arguments = tool_call.object.get("function").?.object.get("arguments").?.string;
             call_tool(tool, arguments, allocator);
         }
-    } else if (message.object.get("content")) |content| {
-        try std.fs.File.stdout().writeAll(content.string);
+        return allocator.dupe(u8, "");
     }
+
+    if (message.object.get("content")) |content| {
+        return allocator.dupe(u8, content.string);
+    }
+
+    return error.MissingContent;
 }
 
 fn call_tool(tool: []const u8, args: []const u8, allocator: std.mem.Allocator) void {
