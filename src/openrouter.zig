@@ -2,39 +2,37 @@ const std = @import("std");
 const types = @import("types.zig");
 const toolset = @import("toolset.zig");
 
-pub fn fetchCompletion(
+pub fn fetchMessage(
     allocator: std.mem.Allocator,
-    prompt: []const u8,
+    messages: []const types.Message,
     api_key: []const u8,
     base_url: []const u8,
-) ![]u8 {
+) !types.Message {
     var body_out: std.io.Writer.Allocating = .init(allocator);
     defer body_out.deinit();
 
-    var jw: std.json.Stringify = .{ .writer = &body_out.writer };
-    try jw.write(.{
-        .model = "anthropic/claude-haiku-4.5",
-        .messages = &[_]types.Message{
-            .{ .role = "user", .content = prompt },
-        },
-        .tools = &[_]types.Tool{types.Tool{
-            .type = "function",
-            .function = .{
-                .name = "read",
-                .description = "Read and return the contents of a file",
-                .parameters = .{
-                    .type = "object",
-                    .properties = .{
-                        .file_path = .{
-                            .type = "string",
-                            .description = "The path to the file to read",
-                        },
-                    },
-                    .required = &.{"file_path"},
-                },
-            },
-        }},
-    });
+    var jw: std.json.Stringify = .{
+        .writer = &body_out.writer,
+        .options = .{ .emit_null_optional_fields = false },
+    };
+
+    try jw.beginObject();
+    try jw.objectField("model");
+    try jw.write("anthropic/claude-haiku-4.5");
+
+    try jw.objectField("messages");
+    try jw.beginArray();
+    for (messages) |message| {
+        try jw.write(message);
+    }
+    try jw.endArray();
+
+    try jw.objectField("tools");
+    try jw.beginArray();
+    try toolset.writeToolDefinitions(&jw);
+    try jw.endArray();
+
+    try jw.endObject();
     const body = body_out.written();
 
     const url_str = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{base_url});
@@ -69,25 +67,45 @@ pub fn fetchCompletion(
         @panic("No choices in response");
     }
 
-    const message = choices.array.items[0].object.get("message").?;
-    if (message.object.get("tool_calls")) |tool_calls| {
-        for (tool_calls.array.items) |tool_call| {
-            const tool = tool_call.object.get("function").?.object.get("name").?.string;
-            const arguments = tool_call.object.get("function").?.object.get("arguments").?.string;
-            call_tool(tool, arguments, allocator);
+    const message_value = choices.array.items[0].object.get("message").?;
+    var message = types.Message{
+        .role = "assistant",
+        .content = "",
+    };
+
+    if (message_value.object.get("content")) |content| {
+        switch (content) {
+            .string => |text| message.content = try allocator.dupe(u8, text),
+            else => {},
         }
-        return allocator.dupe(u8, "");
     }
 
-    if (message.object.get("content")) |content| {
-        return allocator.dupe(u8, content.string);
+    if (message_value.object.get("tool_calls")) |tool_calls_value| {
+        switch (tool_calls_value) {
+            .array => |tool_calls| {
+                const calls = try allocator.alloc(types.ToolCall, tool_calls.items.len);
+                for (tool_calls.items, 0..) |tool_call, idx| {
+                    const tool_obj = tool_call.object;
+                    const id = tool_obj.get("id").?.string;
+                    const tool_type = tool_obj.get("type").?.string;
+                    const function_obj = tool_obj.get("function").?.object;
+                    const name = function_obj.get("name").?.string;
+                    const arguments = function_obj.get("arguments").?.string;
+
+                    calls[idx] = .{
+                        .id = try allocator.dupe(u8, id),
+                        .type = try allocator.dupe(u8, tool_type),
+                        .function = .{
+                            .name = try allocator.dupe(u8, name),
+                            .arguments = try allocator.dupe(u8, arguments),
+                        },
+                    };
+                }
+                message.tool_calls = calls;
+            },
+            else => {},
+        }
     }
 
-    return error.MissingContent;
-}
-
-fn call_tool(tool: []const u8, args: []const u8, allocator: std.mem.Allocator) void {
-    if (toolset.tools.get(tool)) |func| {
-        func(args, allocator);
-    } else std.debug.print("{s}: tool not found\n", .{tool});
+    return message;
 }
