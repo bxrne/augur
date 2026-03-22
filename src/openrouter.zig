@@ -62,9 +62,24 @@ pub fn fetchMessage(
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response_body, .{});
     defer parsed.deinit();
 
-    const choices = parsed.value.object.get("choices") orelse @panic("No choices in response");
+    if (parsed.value.object.get("error")) |err_value| {
+        if (err_value.object.get("message")) |message_value| {
+            if (message_value == .string) {
+                std.debug.print("OpenRouter error: {s}\n", .{message_value.string});
+            }
+        } else {
+            std.debug.print("OpenRouter error response: {s}\n", .{response_body});
+        }
+        return error.ApiError;
+    }
+
+    const choices = parsed.value.object.get("choices") orelse {
+        std.debug.print("Unexpected response: {s}\n", .{response_body});
+        return error.MissingChoices;
+    };
     if (choices.array.items.len == 0) {
-        @panic("No choices in response");
+        std.debug.print("Unexpected response: {s}\n", .{response_body});
+        return error.MissingChoices;
     }
 
     const message_value = choices.array.items[0].object.get("message").?;

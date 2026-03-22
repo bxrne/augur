@@ -3,51 +3,65 @@ const types = @import("types.zig");
 const openrouter = @import("openrouter.zig");
 const toolset = @import("toolset.zig");
 
-const max_turns = 12;
+const max_tool_turns = 12;
 
-pub fn run(
-    allocator: std.mem.Allocator,
-    prompt: []const u8,
+pub const Harness = struct {
+    arena: std.heap.ArenaAllocator,
+    messages: std.ArrayList(types.Message),
     api_key: []const u8,
     base_url: []const u8,
-) ![]u8 {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const temp_allocator = arena.allocator();
 
-    var messages = std.ArrayList(types.Message).empty;
-    defer messages.deinit(temp_allocator);
-    try messages.append(temp_allocator, .{ .role = "user", .content = try temp_allocator.dupe(u8, prompt) });
-
-    var turn: usize = 0;
-    while (turn < max_turns) : (turn += 1) {
-        const response = try openrouter.fetchMessage(
-            temp_allocator,
-            messages.items,
-            api_key,
-            base_url,
-        );
-        try messages.append(temp_allocator, response);
-
-        if (response.tool_calls) |tool_calls| {
-            for (tool_calls) |tool_call| {
-                const tool_output = try toolset.callTool(
-                    tool_call.function.name,
-                    tool_call.function.arguments,
-                    temp_allocator,
-                );
-
-                try messages.append(temp_allocator, .{
-                    .role = "tool",
-                    .content = tool_output,
-                    .tool_call_id = tool_call.id,
-                });
-            }
-            continue;
-        }
-
-        return allocator.dupe(u8, response.content);
+    pub fn init(allocator: std.mem.Allocator, api_key: []const u8, base_url: []const u8) Harness {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .messages = std.ArrayList(types.Message).empty,
+            .api_key = api_key,
+            .base_url = base_url,
+        };
     }
 
-    return error.TooManyTurns;
-}
+    pub fn deinit(self: *Harness) void {
+        self.messages.deinit(self.arena.allocator());
+        self.arena.deinit();
+    }
+
+    pub fn send(self: *Harness, prompt: []const u8) ![]const u8 {
+        const arena_allocator = self.arena.allocator();
+        try self.messages.append(arena_allocator, .{
+            .role = "user",
+            .content = try arena_allocator.dupe(u8, prompt),
+        });
+
+        var turn: usize = 0;
+        while (turn < max_tool_turns) : (turn += 1) {
+            const response = try openrouter.fetchMessage(
+                arena_allocator,
+                self.messages.items,
+                self.api_key,
+                self.base_url,
+            );
+            try self.messages.append(arena_allocator, response);
+
+            if (response.tool_calls) |tool_calls| {
+                for (tool_calls) |tool_call| {
+                    const tool_output = try toolset.callTool(
+                        tool_call.function.name,
+                        tool_call.function.arguments,
+                        arena_allocator,
+                    );
+
+                    try self.messages.append(arena_allocator, .{
+                        .role = "tool",
+                        .content = tool_output,
+                        .tool_call_id = tool_call.id,
+                    });
+                }
+                continue;
+            }
+
+            return response.content;
+        }
+
+        return error.TooManyTurns;
+    }
+};

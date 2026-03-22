@@ -1,34 +1,44 @@
-[![progress-banner](https://backend.codecrafters.io/progress/claude-code/1bf1d068-f51d-469a-9f7b-760691471691)](https://app.codecrafters.io/users/theadambyrne?r=2qF)
+# zip
 
-This is a starting point for Zig solutions to the
-["Build Your own Claude Code" Challenge](https://codecrafters.io/challenges/claude-code).
+`zip` is a tiny Claude-style assistant client written in Zig. It talks to
+OpenRouter, supports tool calling, and ships with a simple REPL.
 
-Claude Code is an AI coding assistant that uses Large Language Models (LLMs) to
-understand code and perform actions through tool calls. In this challenge,
-you'll build your own Claude Code from scratch by implementing an LLM-powered
-coding assistant.
+This project started as the CodeCrafters course "Build your own Claude Code."
 
-Along the way you'll learn about HTTP RESTful APIs, OpenAI-compatible tool
-calling, agent loop, and how to integrate multiple tools into an AI assistant.
+## Requirements
 
-**Note**: If you're viewing this repo on GitHub, head over to
-[codecrafters.io](https://codecrafters.io) to try the challenge.
+- Zig 0.15+
+- An OpenRouter API key (`OPENROUTER_API_KEY`)
 
-# Passing the first stage
-
-The entry point for your `claude-code` implementation is in `src/main.zig`.
-Study and uncomment the relevant code, and submit to pass the first stage:
+## Build
 
 ```sh
-codecrafters submit
+zig build
 ```
 
-# Stage 2 & beyond
+## Run a single prompt
 
-Note: This section is for stages 2 and beyond.
+```sh
+OPENROUTER_API_KEY=... zig build run -- -p "Say hello"
+```
 
-1. Ensure you have `zig (0.15)` installed locally.
-2. Run `./your_program.sh` to run your program, which is implemented in
-   `src/main.zig`.
-3. Run `codecrafters submit` to submit your solution to CodeCrafters. Test
-   output will be streamed to your terminal.
+## Start the REPL
+
+```sh
+OPENROUTER_API_KEY=... zig build run
+```
+
+Type `exit` or `quit` to leave the REPL.
+
+## Environment variables
+
+- `OPENROUTER_API_KEY` (required)
+- `OPENROUTER_BASE_URL` (optional, defaults to `https://openrouter.ai/api/v1`)
+
+## Tools
+
+The assistant can call these tools:
+
+- `read`: Read a file from disk.
+- `write`: Write a file to disk.
+- `bash`: Run a shell command and return stdout/stderr.
