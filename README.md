@@ -55,6 +55,7 @@ The assistant can call these tools:
 ## Roadmap
 
 - [x] Streamed responses 
+- [ ] Model choice
 - [ ] Plan and Build modes
 - [ ] Conversation Mgmt
 - [ ] Web search tool 
