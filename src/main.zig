@@ -1,5 +1,6 @@
 const std = @import("std");
 const harness = @import("harness.zig");
+const types = @import("types.zig");
 
 const Ansi = struct {
     const reset = "\x1b[0m";
@@ -17,6 +18,239 @@ const Ansi = struct {
 const CliOptions = struct {
     prompt: ?[]const u8 = null,
     streaming: bool = true,
+};
+
+const ConversationSnapshot = struct {
+    name: []const u8,
+    mode: harness.Mode,
+    model: []const u8,
+    messages: []types.Message,
+};
+
+const ConversationsFile = struct {
+    version: u32 = 1,
+    active: []const u8,
+    conversations: []ConversationSnapshot,
+};
+
+const Conversation = struct {
+    name: []const u8,
+    mode: harness.Mode,
+    model: []const u8,
+    messages: std.ArrayList(types.Message),
+
+    fn init(allocator: std.mem.Allocator, name: []const u8, mode: harness.Mode, model: []const u8) !Conversation {
+        return .{
+            .name = try allocator.dupe(u8, name),
+            .mode = mode,
+            .model = try allocator.dupe(u8, model),
+            .messages = std.ArrayList(types.Message).empty,
+        };
+    }
+
+    fn deinit(self: *Conversation, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.model);
+        freeMessageSlice(allocator, self.messages.items);
+        self.messages.deinit(allocator);
+    }
+};
+
+const ConversationStore = struct {
+    allocator: std.mem.Allocator,
+    conversations: std.ArrayList(Conversation),
+    active_index: usize,
+
+    const directory_path = "zip";
+    const file_path = "zip/conversations.json";
+    const max_file_size = 32 * 1024 * 1024;
+
+    fn initDefault(allocator: std.mem.Allocator) !ConversationStore {
+        var conversations = std.ArrayList(Conversation).empty;
+        errdefer conversations.deinit(allocator);
+
+        var default_conversation = try Conversation.init(allocator, "default", .plan, harness.default_model);
+        errdefer default_conversation.deinit(allocator);
+
+        try conversations.append(allocator, default_conversation);
+
+        return .{
+            .allocator = allocator,
+            .conversations = conversations,
+            .active_index = 0,
+        };
+    }
+
+    fn loadOrInit(allocator: std.mem.Allocator) !ConversationStore {
+        const cwd = std.fs.cwd();
+        try cwd.makePath(directory_path);
+
+        const file_contents = cwd.readFileAlloc(allocator, file_path, max_file_size) catch |err| switch (err) {
+            error.FileNotFound => return initDefault(allocator),
+            else => return err,
+        };
+        defer allocator.free(file_contents);
+
+        const parsed = try std.json.parseFromSlice(ConversationsFile, allocator, file_contents, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+
+        return fromSnapshot(allocator, parsed.value);
+    }
+
+    fn fromSnapshot(allocator: std.mem.Allocator, snapshot: ConversationsFile) !ConversationStore {
+        if (snapshot.conversations.len == 0) {
+            return initDefault(allocator);
+        }
+
+        var store = ConversationStore{
+            .allocator = allocator,
+            .conversations = std.ArrayList(Conversation).empty,
+            .active_index = 0,
+        };
+        errdefer store.deinit();
+
+        for (snapshot.conversations) |conversation_snapshot| {
+            var conversation = try Conversation.init(
+                allocator,
+                conversation_snapshot.name,
+                conversation_snapshot.mode,
+                conversation_snapshot.model,
+            );
+            errdefer conversation.deinit(allocator);
+
+            for (conversation_snapshot.messages) |message| {
+                try conversation.messages.append(allocator, try cloneMessage(allocator, message));
+            }
+
+            try store.conversations.append(allocator, conversation);
+        }
+
+        if (snapshot.active.len > 0) {
+            if (store.findIndexByName(snapshot.active)) |idx| {
+                store.active_index = idx;
+            }
+        }
+
+        return store;
+    }
+
+    fn deinit(self: *ConversationStore) void {
+        for (self.conversations.items) |*conversation| {
+            conversation.deinit(self.allocator);
+        }
+        self.conversations.deinit(self.allocator);
+    }
+
+    fn save(self: *const ConversationStore) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+
+        const snapshot = try self.toSnapshot(scratch);
+
+        const cwd = std.fs.cwd();
+        try cwd.makePath(directory_path);
+
+        var file = try cwd.createFile(file_path, .{ .truncate = true });
+        defer file.close();
+
+        var file_writer = file.writer(&.{});
+        var json_writer: std.json.Stringify = .{
+            .writer = &file_writer.interface,
+            .options = .{ .emit_null_optional_fields = false },
+        };
+        try json_writer.write(snapshot);
+    }
+
+    fn toSnapshot(self: *const ConversationStore, allocator: std.mem.Allocator) !ConversationsFile {
+        const conversations = try allocator.alloc(ConversationSnapshot, self.conversations.items.len);
+
+        for (self.conversations.items, 0..) |conversation, idx| {
+            const messages = try allocator.alloc(types.Message, conversation.messages.items.len);
+            for (conversation.messages.items, 0..) |message, message_idx| {
+                messages[message_idx] = try cloneMessage(allocator, message);
+            }
+
+            conversations[idx] = .{
+                .name = try allocator.dupe(u8, conversation.name),
+                .mode = conversation.mode,
+                .model = try allocator.dupe(u8, conversation.model),
+                .messages = messages,
+            };
+        }
+
+        return .{
+            .version = 1,
+            .active = try allocator.dupe(u8, self.activeName()),
+            .conversations = conversations,
+        };
+    }
+
+    fn activeName(self: *const ConversationStore) []const u8 {
+        return self.conversations.items[self.active_index].name;
+    }
+
+    fn applyActive(self: *ConversationStore, session: *harness.Harness) !void {
+        const active = &self.conversations.items[self.active_index];
+        try session.loadConversation(active.mode, active.model, active.messages.items);
+    }
+
+    fn syncActiveFromSession(self: *ConversationStore, session: *const harness.Harness) !void {
+        const active = &self.conversations.items[self.active_index];
+        active.mode = session.getMode();
+        try replaceOwnedString(self.allocator, &active.model, session.getModel());
+        try replaceMessageList(self.allocator, &active.messages, session.messagesSlice());
+    }
+
+    fn switchConversation(self: *ConversationStore, session: *harness.Harness, name: []const u8) !bool {
+        try self.syncActiveFromSession(session);
+        const idx = self.findIndexByName(name) orelse return false;
+
+        self.active_index = idx;
+        try self.applyActive(session);
+        return true;
+    }
+
+    fn createConversationAndSwitch(self: *ConversationStore, session: *harness.Harness, requested_name: ?[]const u8) ![]const u8 {
+        try self.syncActiveFromSession(session);
+
+        const maybe_name = requested_name orelse try self.generateConversationName();
+        const should_free_generated = requested_name == null;
+        defer if (should_free_generated) self.allocator.free(maybe_name);
+
+        if (self.findIndexByName(maybe_name) != null) {
+            return error.ConversationAlreadyExists;
+        }
+
+        var conversation = try Conversation.init(self.allocator, maybe_name, .plan, session.getModel());
+        errdefer conversation.deinit(self.allocator);
+
+        try self.conversations.append(self.allocator, conversation);
+        self.active_index = self.conversations.items.len - 1;
+
+        try self.applyActive(session);
+        return self.activeName();
+    }
+
+    fn generateConversationName(self: *const ConversationStore) ![]const u8 {
+        var suffix: usize = self.conversations.items.len + 1;
+        while (true) : (suffix += 1) {
+            const name = try std.fmt.allocPrint(self.allocator, "chat-{d}", .{suffix});
+            if (self.findIndexByName(name) == null) {
+                return name;
+            }
+            self.allocator.free(name);
+        }
+    }
+
+    fn findIndexByName(self: *const ConversationStore, name: []const u8) ?usize {
+        for (self.conversations.items, 0..) |conversation, idx| {
+            if (std.mem.eql(u8, conversation.name, name)) {
+                return idx;
+            }
+        }
+        return null;
+    }
 };
 
 const Spinner = struct {
@@ -104,9 +338,17 @@ fn runRepl(
 ) !void {
     const stdin = std.fs.File.stdin().deprecatedReader();
 
+    var store = try ConversationStore.loadOrInit(allocator);
+    defer store.deinit();
+
+    try store.applyActive(session);
+
     // REPL sessions always start in planning mode.
     try session.setMode(.plan);
-    try writeReplHeader(stdout_file, use_color, session, streaming);
+    try store.syncActiveFromSession(session);
+    try store.save();
+
+    try writeReplHeader(stdout_file, use_color, session, store.activeName(), streaming);
 
     while (true) {
         try writePrompt(stdout_file, use_color, session.getMode());
@@ -121,14 +363,21 @@ fn runRepl(
         if (trimmed.len == 0) {
             continue;
         }
+
         if (trimmed[0] == '/') {
-            switch (try handleSlashCommand(session, trimmed, stdout_file, use_color)) {
-                .handled => continue,
+            switch (try handleSlashCommand(&store, session, trimmed, stdout_file, use_color)) {
+                .handled => {
+                    try store.syncActiveFromSession(session);
+                    try store.save();
+                    continue;
+                },
                 .quit => break,
             }
         }
 
         try runPrompt(session, trimmed, stdout_file, is_tty, use_color, streaming, true);
+        try store.syncActiveFromSession(session);
+        try store.save();
     }
 }
 
@@ -182,6 +431,7 @@ const SlashCommandResult = enum {
 };
 
 fn handleSlashCommand(
+    store: *ConversationStore,
     session: *harness.Harness,
     line: []const u8,
     stdout_file: std.fs.File,
@@ -191,7 +441,7 @@ fn handleSlashCommand(
 
     var iter = std.mem.tokenizeScalar(u8, line[1..], ' ');
     const cmd = iter.next() orelse {
-        try writeStatusLine(stdout_file, use_color, "Commands: /plan /build /model /quit /help");
+        try writeStatusLine(stdout_file, use_color, "Commands: /plan /build /model /new /switch /convos /quit /help");
         return .handled;
     };
 
@@ -221,17 +471,69 @@ fn handleSlashCommand(
         return .handled;
     }
 
+    if (std.mem.eql(u8, cmd, "new")) {
+        const requested_name = iter.next();
+        const conversation_name = store.createConversationAndSwitch(session, requested_name) catch |err| {
+            if (err == error.ConversationAlreadyExists) {
+                try writeStatusLine(stdout_file, use_color, "Conversation already exists. Use /switch <name>.");
+                return .handled;
+            }
+            return err;
+        };
+
+        var buffer: [256]u8 = undefined;
+        const line_out = try std.fmt.bufPrint(&buffer, "Switched to new conversation: {s}", .{conversation_name});
+        try writeStatusLine(stdout_file, use_color, line_out);
+        return .handled;
+    }
+
+    if (std.mem.eql(u8, cmd, "switch")) {
+        const conversation_name = iter.next() orelse {
+            try writeStatusLine(stdout_file, use_color, "Usage: /switch <name>");
+            return .handled;
+        };
+
+        const switched = try store.switchConversation(session, conversation_name);
+        if (!switched) {
+            try writeStatusLine(stdout_file, use_color, "Conversation not found. Try /convos.");
+            return .handled;
+        }
+
+        var buffer: [256]u8 = undefined;
+        const line_out = try std.fmt.bufPrint(&buffer, "Switched to conversation: {s}", .{store.activeName()});
+        try writeStatusLine(stdout_file, use_color, line_out);
+        return .handled;
+    }
+
+    if (std.mem.eql(u8, cmd, "convos")) {
+        try writeStatusLine(stdout_file, use_color, "Conversations:");
+        for (store.conversations.items, 0..) |conversation, idx| {
+            var buffer: [512]u8 = undefined;
+            const marker = if (idx == store.active_index) "*" else " ";
+            const line_out = try std.fmt.bufPrint(
+                &buffer,
+                " {s} {s} (mode={s}, model={s}, messages={d})",
+                .{ marker, conversation.name, harness.modeLabel(conversation.mode), conversation.model, conversation.messages.items.len },
+            );
+            try writeStatusLine(stdout_file, use_color, line_out);
+        }
+        return .handled;
+    }
+
     if (std.mem.eql(u8, cmd, "quit")) {
         return .quit;
     }
 
     if (std.mem.eql(u8, cmd, "help")) {
         try writeStatusLine(stdout_file, use_color, "Slash commands:");
-        try writeStatusLine(stdout_file, use_color, "  /plan        - planning mode (no code)");
-        try writeStatusLine(stdout_file, use_color, "  /build       - build mode (implementation)");
-        try writeStatusLine(stdout_file, use_color, "  /model       - show current OpenRouter model");
-        try writeStatusLine(stdout_file, use_color, "  /model <id>  - switch OpenRouter model");
-        try writeStatusLine(stdout_file, use_color, "  /quit        - leave the REPL");
+        try writeStatusLine(stdout_file, use_color, "  /plan          - planning mode (no code)");
+        try writeStatusLine(stdout_file, use_color, "  /build         - build mode (implementation)");
+        try writeStatusLine(stdout_file, use_color, "  /model         - show current OpenRouter model");
+        try writeStatusLine(stdout_file, use_color, "  /model <id>    - switch OpenRouter model");
+        try writeStatusLine(stdout_file, use_color, "  /new [name]    - create + switch conversation");
+        try writeStatusLine(stdout_file, use_color, "  /switch <name> - switch conversation");
+        try writeStatusLine(stdout_file, use_color, "  /convos        - list conversations");
+        try writeStatusLine(stdout_file, use_color, "  /quit          - leave the REPL");
         return .handled;
     }
 
@@ -256,24 +558,45 @@ fn writeReplHeader(
     stdout_file: std.fs.File,
     use_color: bool,
     session: *const harness.Harness,
+    active_conversation: []const u8,
     streaming: bool,
 ) !void {
     if (use_color) {
         try stdout_file.writeAll(Ansi.border);
     }
-    try stdout_file.writeAll("┌ zip REPL\n");
+    try stdout_file.writeAll("zip • convo=");
     if (use_color) {
-        try stdout_file.writeAll(Ansi.reset);
+        try stdout_file.writeAll(Ansi.label);
     }
-
-    try writeHeaderField(stdout_file, use_color, "mode", harness.modeLabel(session.getMode()), session.getMode());
-    try writeHeaderField(stdout_file, use_color, "model", session.getModel(), null);
-    try writeHeaderField(stdout_file, use_color, "streaming", if (streaming) "on" else "off", null);
-
+    try stdout_file.writeAll(active_conversation);
     if (use_color) {
         try stdout_file.writeAll(Ansi.border);
     }
-    try stdout_file.writeAll("└ /help for commands • /quit to leave\n\n");
+    try stdout_file.writeAll(" • mode=");
+    if (use_color) {
+        try stdout_file.writeAll(modeColor(session.getMode()));
+    }
+    try stdout_file.writeAll(harness.modeLabel(session.getMode()));
+    if (use_color) {
+        try stdout_file.writeAll(Ansi.border);
+    }
+    try stdout_file.writeAll(" • model=");
+    if (use_color) {
+        try stdout_file.writeAll(Ansi.label);
+    }
+    try stdout_file.writeAll(session.getModel());
+    if (use_color) {
+        try stdout_file.writeAll(Ansi.border);
+    }
+    try stdout_file.writeAll(" • streaming=");
+    if (use_color) {
+        try stdout_file.writeAll(Ansi.label);
+    }
+    try stdout_file.writeAll(if (streaming) "on" else "off");
+    if (use_color) {
+        try stdout_file.writeAll(Ansi.border);
+    }
+    try stdout_file.writeAll(" • /help • /quit\n\n");
     if (use_color) {
         try stdout_file.writeAll(Ansi.reset);
     }
@@ -339,6 +662,87 @@ fn writeAssistantPrefix(stdout_file: std.fs.File, use_color: bool) !void {
     if (use_color) {
         try stdout_file.writeAll(Ansi.reset);
     }
+}
+
+fn cloneMessage(allocator: std.mem.Allocator, message: types.Message) !types.Message {
+    var cloned = types.Message{
+        .role = try allocator.dupe(u8, message.role),
+        .content = try allocator.dupe(u8, message.content),
+        .tool_calls = null,
+        .tool_call_id = null,
+    };
+
+    if (message.tool_call_id) |tool_call_id| {
+        cloned.tool_call_id = try allocator.dupe(u8, tool_call_id);
+    }
+
+    if (message.tool_calls) |tool_calls| {
+        const cloned_tool_calls = try allocator.alloc(types.ToolCall, tool_calls.len);
+        for (tool_calls, 0..) |tool_call, idx| {
+            cloned_tool_calls[idx] = .{
+                .id = try allocator.dupe(u8, tool_call.id),
+                .type = try allocator.dupe(u8, tool_call.type),
+                .function = .{
+                    .name = try allocator.dupe(u8, tool_call.function.name),
+                    .arguments = try allocator.dupe(u8, tool_call.function.arguments),
+                },
+            };
+        }
+        cloned.tool_calls = cloned_tool_calls;
+    }
+
+    return cloned;
+}
+
+fn freeMessage(allocator: std.mem.Allocator, message: *const types.Message) void {
+    allocator.free(message.role);
+    allocator.free(message.content);
+
+    if (message.tool_call_id) |tool_call_id| {
+        allocator.free(tool_call_id);
+    }
+
+    if (message.tool_calls) |tool_calls| {
+        for (tool_calls) |tool_call| {
+            allocator.free(tool_call.id);
+            allocator.free(tool_call.type);
+            allocator.free(tool_call.function.name);
+            allocator.free(tool_call.function.arguments);
+        }
+        allocator.free(tool_calls);
+    }
+}
+
+fn freeMessageSlice(allocator: std.mem.Allocator, messages: []const types.Message) void {
+    for (messages) |*message| {
+        freeMessage(allocator, message);
+    }
+}
+
+fn replaceOwnedString(allocator: std.mem.Allocator, slot: *[]const u8, value: []const u8) !void {
+    const duplicated = try allocator.dupe(u8, value);
+    allocator.free(slot.*);
+    slot.* = duplicated;
+}
+
+fn replaceMessageList(
+    allocator: std.mem.Allocator,
+    target: *std.ArrayList(types.Message),
+    source: []const types.Message,
+) !void {
+    var next = std.ArrayList(types.Message).empty;
+    errdefer {
+        freeMessageSlice(allocator, next.items);
+        next.deinit(allocator);
+    }
+
+    for (source) |message| {
+        try next.append(allocator, try cloneMessage(allocator, message));
+    }
+
+    freeMessageSlice(allocator, target.items);
+    target.deinit(allocator);
+    target.* = next;
 }
 
 fn pickStatusPhrase() []const u8 {

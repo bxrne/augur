@@ -35,6 +35,7 @@ pub const SendOptions = struct {
 };
 
 pub const Harness = struct {
+    backing_allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     messages: std.ArrayList(types.Message),
     api_key: []const u8,
@@ -45,6 +46,7 @@ pub const Harness = struct {
 
     pub fn init(allocator: std.mem.Allocator, api_key: []const u8, base_url: []const u8) Harness {
         return .{
+            .backing_allocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
             .messages = std.ArrayList(types.Message).empty,
             .api_key = api_key,
@@ -68,6 +70,10 @@ pub const Harness = struct {
         return self.model;
     }
 
+    pub fn messagesSlice(self: *const Harness) []const types.Message {
+        return self.messages.items;
+    }
+
     pub fn setMode(self: *Harness, mode: Mode) !void {
         self.mode = mode;
         self.system_prompt = systemPrompt(mode);
@@ -77,6 +83,21 @@ pub const Harness = struct {
     pub fn setModel(self: *Harness, model: []const u8) !void {
         const arena_allocator = self.arena.allocator();
         self.model = try arena_allocator.dupe(u8, model);
+    }
+
+    pub fn loadConversation(self: *Harness, mode: Mode, model: []const u8, messages: []const types.Message) !void {
+        self.resetState();
+
+        const arena_allocator = self.arena.allocator();
+        self.mode = mode;
+        self.system_prompt = systemPrompt(mode);
+        self.model = try arena_allocator.dupe(u8, model);
+
+        for (messages) |message| {
+            try self.messages.append(arena_allocator, try duplicateMessage(arena_allocator, message));
+        }
+
+        try self.ensureSystemMessage();
     }
 
     pub fn send(self: *Harness, prompt: []const u8, options: SendOptions) ![]const u8 {
@@ -129,6 +150,47 @@ pub const Harness = struct {
         }
 
         return error.TooManyTurns;
+    }
+
+    fn resetState(self: *Harness) void {
+        self.messages.deinit(self.arena.allocator());
+        self.arena.deinit();
+
+        self.arena = std.heap.ArenaAllocator.init(self.backing_allocator);
+        self.messages = std.ArrayList(types.Message).empty;
+        self.model = default_model;
+        self.mode = .build;
+        self.system_prompt = build_prompt;
+    }
+
+    fn duplicateMessage(allocator: std.mem.Allocator, message: types.Message) !types.Message {
+        var duplicated = types.Message{
+            .role = try allocator.dupe(u8, message.role),
+            .content = try allocator.dupe(u8, message.content),
+            .tool_calls = null,
+            .tool_call_id = null,
+        };
+
+        if (message.tool_call_id) |tool_call_id| {
+            duplicated.tool_call_id = try allocator.dupe(u8, tool_call_id);
+        }
+
+        if (message.tool_calls) |tool_calls| {
+            const duplicated_calls = try allocator.alloc(types.ToolCall, tool_calls.len);
+            for (tool_calls, 0..) |tool_call, idx| {
+                duplicated_calls[idx] = .{
+                    .id = try allocator.dupe(u8, tool_call.id),
+                    .type = try allocator.dupe(u8, tool_call.type),
+                    .function = .{
+                        .name = try allocator.dupe(u8, tool_call.function.name),
+                        .arguments = try allocator.dupe(u8, tool_call.function.arguments),
+                    },
+                };
+            }
+            duplicated.tool_calls = duplicated_calls;
+        }
+
+        return duplicated;
     }
 
     fn ensureSystemMessage(self: *Harness) !void {
