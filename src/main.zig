@@ -482,7 +482,12 @@ fn handleSlashCommand(
         };
 
         var buffer: [256]u8 = undefined;
-        const line_out = try std.fmt.bufPrint(&buffer, "Switched to new conversation: {s}", .{conversation_name});
+        const loaded_count = contextMessageCount(session.messagesSlice());
+        const line_out = try std.fmt.bufPrint(
+            &buffer,
+            "Switched to new conversation: {s} (loaded {d} messages)",
+            .{ conversation_name, loaded_count },
+        );
         try writeStatusLine(stdout_file, use_color, line_out);
         return .handled;
     }
@@ -500,7 +505,12 @@ fn handleSlashCommand(
         }
 
         var buffer: [256]u8 = undefined;
-        const line_out = try std.fmt.bufPrint(&buffer, "Switched to conversation: {s}", .{store.activeName()});
+        const loaded_count = contextMessageCount(session.messagesSlice());
+        const line_out = try std.fmt.bufPrint(
+            &buffer,
+            "Switched to conversation: {s} (loaded {d} messages)",
+            .{ store.activeName(), loaded_count },
+        );
         try writeStatusLine(stdout_file, use_color, line_out);
         return .handled;
     }
@@ -596,7 +606,7 @@ fn writeReplHeader(
     if (use_color) {
         try stdout_file.writeAll(Ansi.border);
     }
-    try stdout_file.writeAll(" • /help • /quit\n\n");
+    try stdout_file.writeAll(" • /help • /quit\n");
     if (use_color) {
         try stdout_file.writeAll(Ansi.reset);
     }
@@ -662,6 +672,16 @@ fn writeAssistantPrefix(stdout_file: std.fs.File, use_color: bool) !void {
     if (use_color) {
         try stdout_file.writeAll(Ansi.reset);
     }
+}
+
+fn contextMessageCount(messages: []const types.Message) usize {
+    var count: usize = 0;
+    for (messages) |message| {
+        if (!std.mem.eql(u8, message.role, "system")) {
+            count += 1;
+        }
+    }
+    return count;
 }
 
 fn cloneMessage(allocator: std.mem.Allocator, message: types.Message) !types.Message {

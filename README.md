@@ -36,7 +36,9 @@ Type `/quit` to leave the REPL.
 
 Streaming is on by default; pass `--no-stream` to buffer responses. The REPL
 uses ANSI colors when stdout is a TTY, starts in **plan** mode, and shows the
-active model in the startup header.
+active model in the startup header. Conversations are persisted to
+`./zip/conversations.json` and switching conversations restores their message
+history into the active context buffer.
 
 ### Slash commands
 
@@ -44,7 +46,11 @@ Inside the REPL:
 
 - `/plan` switches to plan mode (high-level steps, no code).
 - `/build` switches to build mode (implementation + code).
+- `/model` shows the current model.
 - `/model <id>` changes the OpenRouter model.
+- `/new [name]` creates and switches to a new conversation.
+- `/switch <name>` switches to a saved conversation (loads its history into context).
+- `/convos` lists all conversations.
 - `/quit` exits the REPL.
 - `/help` shows the command list.
 
