@@ -42,3 +42,12 @@ The assistant can call these tools:
 - `read`: Read a file from disk.
 - `write`: Write a file to disk.
 - `bash`: Run a shell command and return stdout/stderr.
+
+## Roadmap
+
+- [ ] Streamed responses 
+- [ ] Plan and Build modes
+- [ ] Conversation Mgmt
+- [ ] Web search tool 
+- [ ] Subagents
+
