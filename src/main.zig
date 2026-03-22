@@ -7,6 +7,11 @@ const Ansi = struct {
     const assistant = "\x1b[1;32m";
     const spinner = "\x1b[1;33m";
     const status = "\x1b[1;35m";
+    const label = "\x1b[1;37m";
+    const border = "\x1b[38;5;244m";
+    const dim = "\x1b[2m";
+    const mode_plan = "\x1b[1;34m";
+    const mode_build = "\x1b[1;32m";
 };
 
 const CliOptions = struct {
@@ -99,6 +104,10 @@ fn runRepl(
 ) !void {
     const stdin = std.fs.File.stdin().deprecatedReader();
 
+    // REPL sessions always start in planning mode.
+    try session.setMode(.plan);
+    try writeReplHeader(stdout_file, use_color, session, streaming);
+
     while (true) {
         try writePrompt(stdout_file, use_color, session.getMode());
         const line_opt = try stdin.readUntilDelimiterOrEofAlloc(allocator, '\n', 1024 * 1024);
@@ -112,13 +121,10 @@ fn runRepl(
         if (trimmed.len == 0) {
             continue;
         }
-        if (std.mem.eql(u8, trimmed, "exit") or std.mem.eql(u8, trimmed, "quit")) {
-            break;
-        }
-
         if (trimmed[0] == '/') {
-            if (try handleSlashCommand(session, trimmed, stdout_file, use_color)) {
-                continue;
+            switch (try handleSlashCommand(session, trimmed, stdout_file, use_color)) {
+                .handled => continue,
+                .quit => break,
             }
         }
 
@@ -170,30 +176,35 @@ fn runPrompt(
     }
 }
 
+const SlashCommandResult = enum {
+    handled,
+    quit,
+};
+
 fn handleSlashCommand(
     session: *harness.Harness,
     line: []const u8,
     stdout_file: std.fs.File,
     use_color: bool,
-) !bool {
-    if (line.len == 0 or line[0] != '/') return false;
+) !SlashCommandResult {
+    if (line.len == 0 or line[0] != '/') return .handled;
 
     var iter = std.mem.tokenizeScalar(u8, line[1..], ' ');
     const cmd = iter.next() orelse {
-        try writeStatusLine(stdout_file, use_color, "Commands: /plan /build /model /help");
-        return true;
+        try writeStatusLine(stdout_file, use_color, "Commands: /plan /build /model /quit /help");
+        return .handled;
     };
 
     if (std.mem.eql(u8, cmd, "plan")) {
         try session.setMode(.plan);
         try writeStatusLine(stdout_file, use_color, "Mode set to plan.");
-        return true;
+        return .handled;
     }
 
     if (std.mem.eql(u8, cmd, "build")) {
         try session.setMode(.build);
         try writeStatusLine(stdout_file, use_color, "Mode set to build.");
-        return true;
+        return .handled;
     }
 
     if (std.mem.eql(u8, cmd, "model")) {
@@ -207,21 +218,27 @@ fn handleSlashCommand(
             const line_out = try std.fmt.bufPrint(&buffer, "Current model: {s}", .{session.getModel()});
             try writeStatusLine(stdout_file, use_color, line_out);
         }
-        return true;
+        return .handled;
+    }
+
+    if (std.mem.eql(u8, cmd, "quit")) {
+        return .quit;
     }
 
     if (std.mem.eql(u8, cmd, "help")) {
         try writeStatusLine(stdout_file, use_color, "Slash commands:");
-        try writeStatusLine(stdout_file, use_color, "  /plan  - planning mode (no code)");
-        try writeStatusLine(stdout_file, use_color, "  /build - build mode (implementation)");
-        try writeStatusLine(stdout_file, use_color, "  /model <id> - switch OpenRouter model");
-        return true;
+        try writeStatusLine(stdout_file, use_color, "  /plan        - planning mode (no code)");
+        try writeStatusLine(stdout_file, use_color, "  /build       - build mode (implementation)");
+        try writeStatusLine(stdout_file, use_color, "  /model       - show current OpenRouter model");
+        try writeStatusLine(stdout_file, use_color, "  /model <id>  - switch OpenRouter model");
+        try writeStatusLine(stdout_file, use_color, "  /quit        - leave the REPL");
+        return .handled;
     }
 
     var buffer: [256]u8 = undefined;
     const line_out = try std.fmt.bufPrint(&buffer, "Unknown command: /{s}. Try /help.", .{cmd});
     try writeStatusLine(stdout_file, use_color, line_out);
-    return true;
+    return .handled;
 }
 
 fn writeStatusLine(stdout_file: std.fs.File, use_color: bool, message: []const u8) !void {
@@ -235,13 +252,80 @@ fn writeStatusLine(stdout_file: std.fs.File, use_color: bool, message: []const u
     try stdout_file.writeAll("\n");
 }
 
+fn writeReplHeader(
+    stdout_file: std.fs.File,
+    use_color: bool,
+    session: *const harness.Harness,
+    streaming: bool,
+) !void {
+    if (use_color) {
+        try stdout_file.writeAll(Ansi.border);
+    }
+    try stdout_file.writeAll("┌ zip REPL\n");
+    if (use_color) {
+        try stdout_file.writeAll(Ansi.reset);
+    }
+
+    try writeHeaderField(stdout_file, use_color, "mode", harness.modeLabel(session.getMode()), session.getMode());
+    try writeHeaderField(stdout_file, use_color, "model", session.getModel(), null);
+    try writeHeaderField(stdout_file, use_color, "streaming", if (streaming) "on" else "off", null);
+
+    if (use_color) {
+        try stdout_file.writeAll(Ansi.border);
+    }
+    try stdout_file.writeAll("└ /help for commands • /quit to leave\n\n");
+    if (use_color) {
+        try stdout_file.writeAll(Ansi.reset);
+    }
+}
+
+fn writeHeaderField(
+    stdout_file: std.fs.File,
+    use_color: bool,
+    label: []const u8,
+    value: []const u8,
+    mode_opt: ?harness.Mode,
+) !void {
+    if (use_color) {
+        try stdout_file.writeAll(Ansi.border);
+    }
+    try stdout_file.writeAll("│ ");
+    if (use_color) {
+        try stdout_file.writeAll(Ansi.dim);
+    }
+    try stdout_file.writeAll(label);
+    try stdout_file.writeAll(": ");
+    if (use_color) {
+        try stdout_file.writeAll(Ansi.reset);
+        if (mode_opt) |mode| {
+            try stdout_file.writeAll(modeColor(mode));
+        } else {
+            try stdout_file.writeAll(Ansi.label);
+        }
+    }
+    try stdout_file.writeAll(value);
+    if (use_color) {
+        try stdout_file.writeAll(Ansi.border);
+    }
+    try stdout_file.writeAll("\n");
+}
+
+fn modeColor(mode: harness.Mode) []const u8 {
+    return switch (mode) {
+        .plan => Ansi.mode_plan,
+        .build => Ansi.mode_build,
+    };
+}
+
 fn writePrompt(stdout_file: std.fs.File, use_color: bool, mode: harness.Mode) !void {
+    if (use_color) {
+        try stdout_file.writeAll(modeColor(mode));
+    }
+    try stdout_file.writeAll(harness.modeLabel(mode));
     if (use_color) {
         try stdout_file.writeAll(Ansi.prompt);
     }
-    try stdout_file.writeAll("zip[");
-    try stdout_file.writeAll(harness.modeLabel(mode));
-    try stdout_file.writeAll("]> ");
+    try stdout_file.writeAll("> ");
     if (use_color) {
         try stdout_file.writeAll(Ansi.reset);
     }
@@ -251,7 +335,7 @@ fn writeAssistantPrefix(stdout_file: std.fs.File, use_color: bool) !void {
     if (use_color) {
         try stdout_file.writeAll(Ansi.assistant);
     }
-    try stdout_file.writeAll("assistant> ");
+    try stdout_file.writeAll("> ");
     if (use_color) {
         try stdout_file.writeAll(Ansi.reset);
     }

@@ -32,10 +32,11 @@ OPENROUTER_API_KEY=... zig build run -- -p "Say hello" --no-stream
 OPENROUTER_API_KEY=... zig build run
 ```
 
-Type `exit` or `quit` to leave the REPL.
+Type `/quit` to leave the REPL.
 
 Streaming is on by default; pass `--no-stream` to buffer responses. The REPL
-uses ANSI colors when stdout is a TTY.
+uses ANSI colors when stdout is a TTY, starts in **plan** mode, and shows the
+active model in the startup header.
 
 ### Slash commands
 
@@ -44,9 +45,10 @@ Inside the REPL:
 - `/plan` switches to plan mode (high-level steps, no code).
 - `/build` switches to build mode (implementation + code).
 - `/model <id>` changes the OpenRouter model.
+- `/quit` exits the REPL.
 - `/help` shows the command list.
 
-In the REPL, prompts are prefixed with `>` and assistant responses with `zap>`.
+In the REPL, prompts are prefixed with `mode>` (for example `plan>`) and assistant responses with `>`. 
 
 ## Environment variables
 
