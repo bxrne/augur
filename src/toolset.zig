@@ -1,5 +1,10 @@
 const std = @import("std");
 
+const Ansi = struct {
+    const dim = "\x1b[2m";
+    const reset = "\x1b[0m";
+};
+
 pub const ToolFn = *const fn (std.mem.Allocator, []const u8) anyerror![]u8;
 
 pub const tools = std.StaticStringMap(ToolFn).initComptime(.{
@@ -7,6 +12,23 @@ pub const tools = std.StaticStringMap(ToolFn).initComptime(.{
     .{ "write", &write },
     .{ "bash", &bash },
 });
+
+fn logToolCall(name: []const u8, label: []const u8, value: []const u8) void {
+    var stderr_file = std.fs.File.stderr();
+    const use_color = stderr_file.isTty();
+    var stderr_writer = stderr_file.writer(&.{});
+    const writer = &stderr_writer.interface;
+
+    if (use_color) {
+        writer.writeAll(Ansi.dim) catch {};
+    }
+    writer.print("tool call: {s} {s}={s}", .{ name, label, value }) catch {};
+    if (use_color) {
+        writer.writeAll(Ansi.reset) catch {};
+    }
+    writer.writeAll("\n") catch {};
+    writer.flush() catch {};
+}
 
 pub fn callTool(name: []const u8, args: []const u8, allocator: std.mem.Allocator) ![]u8 {
     if (tools.get(name)) |func| {
@@ -140,6 +162,7 @@ fn read(allocator: std.mem.Allocator, args: []const u8) anyerror![]u8 {
     defer parsed.deinit();
 
     const file_path = parsed.value.file_path;
+    logToolCall("read", "file", file_path);
 
     const file = try std.fs.cwd().openFile(file_path, .{});
     defer file.close();
@@ -158,6 +181,7 @@ fn write(allocator: std.mem.Allocator, args: []const u8) anyerror![]u8 {
 
     const file_path = parsed.value.file_path;
     const contents = parsed.value.content;
+    logToolCall("write", "file", file_path);
 
     const file = try std.fs.cwd().createFile(file_path, .{ .truncate = true });
     defer file.close();
@@ -177,6 +201,7 @@ fn bash(allocator: std.mem.Allocator, args: []const u8) anyerror![]u8 {
     defer parsed.deinit();
 
     const command = parsed.value.command;
+    logToolCall("bash", "command", command);
     const result = try std.process.Child.run(.{
         .allocator = allocator,
         .argv = &[_][]const u8{ "bash", "-lc", command },
