@@ -37,6 +37,15 @@ Type `exit` or `quit` to leave the REPL.
 Streaming is on by default; pass `--no-stream` to buffer responses. The REPL
 uses ANSI colors when stdout is a TTY.
 
+### Slash commands
+
+Inside the REPL:
+
+- `/plan` switches to plan mode (high-level steps, no code).
+- `/build` switches to build mode (implementation + code).
+- `/model <id>` changes the OpenRouter model.
+- `/help` shows the command list.
+
 In the REPL, prompts are prefixed with `>` and assistant responses with `zap>`.
 
 ## Environment variables
@@ -55,8 +64,8 @@ The assistant can call these tools:
 ## Roadmap
 
 - [x] Streamed responses 
-- [ ] Model choice
-- [ ] Plan and Build modes
+- [x] Model choice
+- [x] Plan and Build modes
 - [ ] Conversation Mgmt
 - [ ] Web search tool 
 - [ ] Subagents

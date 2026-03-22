@@ -6,6 +6,7 @@ const Ansi = struct {
     const prompt = "\x1b[1;36m";
     const assistant = "\x1b[1;32m";
     const spinner = "\x1b[1;33m";
+    const status = "\x1b[1;35m";
 };
 
 const CliOptions = struct {
@@ -99,7 +100,7 @@ fn runRepl(
     const stdin = std.fs.File.stdin().deprecatedReader();
 
     while (true) {
-        try writePrompt(stdout_file, use_color);
+        try writePrompt(stdout_file, use_color, session.getMode());
         const line_opt = try stdin.readUntilDelimiterOrEofAlloc(allocator, '\n', 1024 * 1024);
         if (line_opt == null) {
             break;
@@ -113,6 +114,12 @@ fn runRepl(
         }
         if (std.mem.eql(u8, trimmed, "exit") or std.mem.eql(u8, trimmed, "quit")) {
             break;
+        }
+
+        if (trimmed[0] == '/') {
+            if (try handleSlashCommand(session, trimmed, stdout_file, use_color)) {
+                continue;
+            }
         }
 
         try runPrompt(session, trimmed, stdout_file, is_tty, use_color, streaming, true);
@@ -163,11 +170,78 @@ fn runPrompt(
     }
 }
 
-fn writePrompt(stdout_file: std.fs.File, use_color: bool) !void {
+fn handleSlashCommand(
+    session: *harness.Harness,
+    line: []const u8,
+    stdout_file: std.fs.File,
+    use_color: bool,
+) !bool {
+    if (line.len == 0 or line[0] != '/') return false;
+
+    var iter = std.mem.tokenizeScalar(u8, line[1..], ' ');
+    const cmd = iter.next() orelse {
+        try writeStatusLine(stdout_file, use_color, "Commands: /plan /build /model /help");
+        return true;
+    };
+
+    if (std.mem.eql(u8, cmd, "plan")) {
+        try session.setMode(.plan);
+        try writeStatusLine(stdout_file, use_color, "Mode set to plan.");
+        return true;
+    }
+
+    if (std.mem.eql(u8, cmd, "build")) {
+        try session.setMode(.build);
+        try writeStatusLine(stdout_file, use_color, "Mode set to build.");
+        return true;
+    }
+
+    if (std.mem.eql(u8, cmd, "model")) {
+        if (iter.next()) |model| {
+            try session.setModel(model);
+            var buffer: [256]u8 = undefined;
+            const line_out = try std.fmt.bufPrint(&buffer, "Model set to {s}.", .{model});
+            try writeStatusLine(stdout_file, use_color, line_out);
+        } else {
+            var buffer: [256]u8 = undefined;
+            const line_out = try std.fmt.bufPrint(&buffer, "Current model: {s}", .{session.getModel()});
+            try writeStatusLine(stdout_file, use_color, line_out);
+        }
+        return true;
+    }
+
+    if (std.mem.eql(u8, cmd, "help")) {
+        try writeStatusLine(stdout_file, use_color, "Slash commands:");
+        try writeStatusLine(stdout_file, use_color, "  /plan  - planning mode (no code)");
+        try writeStatusLine(stdout_file, use_color, "  /build - build mode (implementation)");
+        try writeStatusLine(stdout_file, use_color, "  /model <id> - switch OpenRouter model");
+        return true;
+    }
+
+    var buffer: [256]u8 = undefined;
+    const line_out = try std.fmt.bufPrint(&buffer, "Unknown command: /{s}. Try /help.", .{cmd});
+    try writeStatusLine(stdout_file, use_color, line_out);
+    return true;
+}
+
+fn writeStatusLine(stdout_file: std.fs.File, use_color: bool, message: []const u8) !void {
+    if (use_color) {
+        try stdout_file.writeAll(Ansi.status);
+    }
+    try stdout_file.writeAll(message);
+    if (use_color) {
+        try stdout_file.writeAll(Ansi.reset);
+    }
+    try stdout_file.writeAll("\n");
+}
+
+fn writePrompt(stdout_file: std.fs.File, use_color: bool, mode: harness.Mode) !void {
     if (use_color) {
         try stdout_file.writeAll(Ansi.prompt);
     }
-    try stdout_file.writeAll("> ");
+    try stdout_file.writeAll("zip[");
+    try stdout_file.writeAll(harness.modeLabel(mode));
+    try stdout_file.writeAll("]> ");
     if (use_color) {
         try stdout_file.writeAll(Ansi.reset);
     }
@@ -177,7 +251,7 @@ fn writeAssistantPrefix(stdout_file: std.fs.File, use_color: bool) !void {
     if (use_color) {
         try stdout_file.writeAll(Ansi.assistant);
     }
-    try stdout_file.writeAll("zip> ");
+    try stdout_file.writeAll("assistant> ");
     if (use_color) {
         try stdout_file.writeAll(Ansi.reset);
     }

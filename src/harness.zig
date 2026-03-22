@@ -5,6 +5,30 @@ const toolset = @import("toolset.zig");
 
 const max_tool_turns = 12;
 
+pub const Mode = enum {
+    build,
+    plan,
+};
+
+pub const default_model = "anthropic/claude-haiku-4.5";
+
+const build_prompt = "You are in build mode. Provide concise implementation guidance and code when needed. Be direct and practical.";
+const plan_prompt = "You are in plan mode. Provide a short plan with bullet points or steps. Avoid code until build mode is selected.";
+
+pub fn modeLabel(mode: Mode) []const u8 {
+    return switch (mode) {
+        .build => "build",
+        .plan => "plan",
+    };
+}
+
+fn systemPrompt(mode: Mode) []const u8 {
+    return switch (mode) {
+        .build => build_prompt,
+        .plan => plan_prompt,
+    };
+}
+
 pub const SendOptions = struct {
     streaming: bool = false,
     stream_output: ?std.fs.File = null,
@@ -15,6 +39,9 @@ pub const Harness = struct {
     messages: std.ArrayList(types.Message),
     api_key: []const u8,
     base_url: []const u8,
+    model: []const u8,
+    mode: Mode,
+    system_prompt: []const u8,
 
     pub fn init(allocator: std.mem.Allocator, api_key: []const u8, base_url: []const u8) Harness {
         return .{
@@ -22,6 +49,9 @@ pub const Harness = struct {
             .messages = std.ArrayList(types.Message).empty,
             .api_key = api_key,
             .base_url = base_url,
+            .model = default_model,
+            .mode = .build,
+            .system_prompt = build_prompt,
         };
     }
 
@@ -30,8 +60,28 @@ pub const Harness = struct {
         self.arena.deinit();
     }
 
+    pub fn getMode(self: *const Harness) Mode {
+        return self.mode;
+    }
+
+    pub fn getModel(self: *const Harness) []const u8 {
+        return self.model;
+    }
+
+    pub fn setMode(self: *Harness, mode: Mode) !void {
+        self.mode = mode;
+        self.system_prompt = systemPrompt(mode);
+        try self.ensureSystemMessage();
+    }
+
+    pub fn setModel(self: *Harness, model: []const u8) !void {
+        const arena_allocator = self.arena.allocator();
+        self.model = try arena_allocator.dupe(u8, model);
+    }
+
     pub fn send(self: *Harness, prompt: []const u8, options: SendOptions) ![]const u8 {
         const arena_allocator = self.arena.allocator();
+        try self.ensureSystemMessage();
         try self.messages.append(arena_allocator, .{
             .role = "user",
             .content = try arena_allocator.dupe(u8, prompt),
@@ -45,6 +95,7 @@ pub const Harness = struct {
                     self.messages.items,
                     self.api_key,
                     self.base_url,
+                    self.model,
                     options.stream_output,
                 )
             else
@@ -53,6 +104,7 @@ pub const Harness = struct {
                     self.messages.items,
                     self.api_key,
                     self.base_url,
+                    self.model,
                 );
             try self.messages.append(arena_allocator, response);
 
@@ -77,5 +129,29 @@ pub const Harness = struct {
         }
 
         return error.TooManyTurns;
+    }
+
+    fn ensureSystemMessage(self: *Harness) !void {
+        if (self.system_prompt.len == 0) return;
+        const arena_allocator = self.arena.allocator();
+        const content = try arena_allocator.dupe(u8, self.system_prompt);
+
+        if (self.messages.items.len == 0) {
+            try self.messages.append(arena_allocator, .{
+                .role = "system",
+                .content = content,
+            });
+            return;
+        }
+
+        if (!std.mem.eql(u8, self.messages.items[0].role, "system")) {
+            try self.messages.insert(arena_allocator, 0, .{
+                .role = "system",
+                .content = content,
+            });
+            return;
+        }
+
+        self.messages.items[0].content = content;
     }
 };

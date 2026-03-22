@@ -265,8 +265,9 @@ pub fn fetchMessage(
     messages: []const types.Message,
     api_key: []const u8,
     base_url: []const u8,
+    model: []const u8,
 ) !types.Message {
-    var body_out = try buildRequestBody(allocator, messages, false);
+    var body_out = try buildRequestBody(allocator, messages, model, false);
     defer body_out.deinit();
     const body = body_out.written();
 
@@ -365,9 +366,10 @@ pub fn streamMessage(
     messages: []const types.Message,
     api_key: []const u8,
     base_url: []const u8,
+    model: []const u8,
     output_file: ?std.fs.File,
 ) !types.Message {
-    var body_out = try buildRequestBody(allocator, messages, true);
+    var body_out = try buildRequestBody(allocator, messages, model, true);
     defer body_out.deinit();
     const body = body_out.written();
 
@@ -412,6 +414,7 @@ pub fn streamMessage(
 fn buildRequestBody(
     allocator: std.mem.Allocator,
     messages: []const types.Message,
+    model: []const u8,
     stream: bool,
 ) !std.io.Writer.Allocating {
     var body_out: std.io.Writer.Allocating = .init(allocator);
@@ -424,7 +427,7 @@ fn buildRequestBody(
 
     try jw.beginObject();
     try jw.objectField("model");
-    try jw.write("anthropic/claude-haiku-4.5");
+    try jw.write(model);
 
     if (stream) {
         try jw.objectField("stream");
