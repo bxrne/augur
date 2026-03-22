@@ -5,6 +5,11 @@ const toolset = @import("toolset.zig");
 
 const max_tool_turns = 12;
 
+pub const SendOptions = struct {
+    streaming: bool = false,
+    stream_output: ?std.fs.File = null,
+};
+
 pub const Harness = struct {
     arena: std.heap.ArenaAllocator,
     messages: std.ArrayList(types.Message),
@@ -25,7 +30,7 @@ pub const Harness = struct {
         self.arena.deinit();
     }
 
-    pub fn send(self: *Harness, prompt: []const u8) ![]const u8 {
+    pub fn send(self: *Harness, prompt: []const u8, options: SendOptions) ![]const u8 {
         const arena_allocator = self.arena.allocator();
         try self.messages.append(arena_allocator, .{
             .role = "user",
@@ -34,12 +39,21 @@ pub const Harness = struct {
 
         var turn: usize = 0;
         while (turn < max_tool_turns) : (turn += 1) {
-            const response = try openrouter.fetchMessage(
-                arena_allocator,
-                self.messages.items,
-                self.api_key,
-                self.base_url,
-            );
+            const response = if (options.streaming)
+                try openrouter.streamMessage(
+                    arena_allocator,
+                    self.messages.items,
+                    self.api_key,
+                    self.base_url,
+                    options.stream_output,
+                )
+            else
+                try openrouter.fetchMessage(
+                    arena_allocator,
+                    self.messages.items,
+                    self.api_key,
+                    self.base_url,
+                );
             try self.messages.append(arena_allocator, response);
 
             if (response.tool_calls) |tool_calls| {

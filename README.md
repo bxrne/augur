@@ -19,7 +19,11 @@ zig build
 ## Run a single prompt
 
 ```sh
+# streams by default
 OPENROUTER_API_KEY=... zig build run -- -p "Say hello"
+
+# buffered output (shows a spinner in TTYs)
+OPENROUTER_API_KEY=... zig build run -- -p "Say hello" --no-stream
 ```
 
 ## Start the REPL
@@ -29,6 +33,11 @@ OPENROUTER_API_KEY=... zig build run
 ```
 
 Type `exit` or `quit` to leave the REPL.
+
+Streaming is on by default; pass `--no-stream` to buffer responses. The REPL
+uses ANSI colors when stdout is a TTY.
+
+In the REPL, prompts are prefixed with `>` and assistant responses with `zap>`.
 
 ## Environment variables
 
@@ -45,9 +54,8 @@ The assistant can call these tools:
 
 ## Roadmap
 
-- [ ] Streamed responses 
+- [x] Streamed responses 
 - [ ] Plan and Build modes
 - [ ] Conversation Mgmt
 - [ ] Web search tool 
 - [ ] Subagents
-
