@@ -1,35 +1,5 @@
 const std = @import("std");
-
-const Message = struct {
-    role: []const u8,
-    content: []const u8,
-};
-
-const Property = struct {
-    type: []const u8,
-    description: []const u8,
-};
-
-const ReadProperties = struct {
-    file_path: Property,
-};
-
-const Parameters = struct {
-    type: []const u8, // always "object"
-    properties: ReadProperties,
-    required: []const []const u8,
-};
-
-const Function = struct {
-    name: []const u8,
-    description: []const u8,
-    parameters: Parameters,
-};
-
-const Tool = struct {
-    type: []const u8, // always "function"
-    function: Function,
-};
+const openrouter = @import("openrouter.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -47,69 +17,11 @@ pub fn main() !void {
     const api_key = std.posix.getenv("OPENROUTER_API_KEY") orelse @panic("OPENROUTER_API_KEY is not set");
     const base_url = std.posix.getenv("OPENROUTER_BASE_URL") orelse "https://openrouter.ai/api/v1";
 
-    // Build request body
-    var body_out: std.io.Writer.Allocating = .init(allocator);
-    defer body_out.deinit();
-    var jw: std.json.Stringify = .{ .writer = &body_out.writer };
-    try jw.write(.{ .model = "anthropic/claude-haiku-4.5", .messages = &[_]Message{
-        .{ .role = "user", .content = prompt_str },
-    }, .tools = &[_]Tool{Tool{
-        .type = "function",
-        .function = .{
-            .name = "Read",
-            .description = "Read and return the contents of a file",
-            .parameters = .{
-                .type = "object",
-                .properties = .{
-                    .file_path = .{
-                        .type = "string",
-                        .description = "The path to the file to read",
-                    },
-                },
-                .required = &.{"file_path"},
-            },
-        },
-    }} });
-    const body = body_out.written();
-
-    // Build URL and auth header
-    const url_str = try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{base_url});
-    defer allocator.free(url_str);
-
-    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
-    defer allocator.free(auth_value);
-
-    // Make HTTP request
-    var client: std.http.Client = .{ .allocator = allocator };
-    defer client.deinit();
-
-    var response_out: std.io.Writer.Allocating = .init(allocator);
-    defer response_out.deinit();
-
-    _ = try client.fetch(.{
-        .location = .{ .url = url_str },
-        .method = .POST,
-        .payload = body,
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = "application/json" },
-            .{ .name = "authorization", .value = auth_value },
-        },
-        .response_writer = &response_out.writer,
-    });
-    const response_body = response_out.written();
-
-    // Parse response
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response_body, .{});
-    defer parsed.deinit();
-
-    const choices = parsed.value.object.get("choices") orelse @panic("No choices in response");
-    if (choices.array.items.len == 0) {
-        @panic("No choices in response");
-    }
+    const content = try openrouter.fetchCompletion(allocator, prompt_str, api_key, base_url);
+    defer allocator.free(content);
 
     // You can use print statements as follows for debugging, they'll be visible when running tests.
     std.debug.print("Logs from your program will appear here!\n", .{});
 
-    const content = choices.array.items[0].object.get("message").?.object.get("content").?.string;
     try std.fs.File.stdout().writeAll(content);
 }
