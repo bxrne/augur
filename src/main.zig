@@ -17,7 +17,11 @@ pub fn main() !void {
     const base_url = std.posix.getenv("OPENROUTER_BASE_URL") orelse
         "https://openrouter.ai/api/v1";
 
-    var session = harness.Harness.init(allocator, api_key, base_url);
+    var session = try harness.Harness.init(
+        allocator,
+        api_key,
+        base_url,
+    );
     defer session.deinit();
 
     const options = try cli_args.parse(args);

@@ -6,6 +6,7 @@ const openrouter = @import("../api/openrouter.zig");
 const toolset = @import("../api/toolset.zig");
 const msg = @import("../core/message_pool.zig");
 const limits = @import("../core/limits.zig");
+const skills = @import("skills.zig");
 
 pub const Mode = types.Mode;
 pub const mode_label = types.mode_label;
@@ -13,28 +14,38 @@ pub const mode_label = types.mode_label;
 pub const default_model = "anthropic/claude-haiku-4.5";
 
 const preamble =
-    "You are augur, a command-line coding assistant." ++
-    " You are running in the user's terminal with access" ++
+    "You are augur, a terminal coding assistant." ++
+    " Be precise, safe, and helpful." ++
+    " Personality: concise, direct, friendly." ++
+    " Never guess or invent results." ++
+    " Keep users informed with short progress updates" ++
+    " before grouped tool actions." ++
+    " For non-trivial work, use short step-by-step plans" ++
+    " and update progress as steps complete." ++
+    " Prefer root-cause fixes with minimal, focused diffs." ++
+    " Validate with targeted checks when practical." ++
+    "\n\n" ++
+    "You are running in the user's terminal with access" ++
     " to their working directory." ++
-    " You have three tools:" ++
-    " `read` (read a file), `write` (write a file)," ++
-    " and `bash` (run a shell command)." ++
-    " Always use tools when the user asks you to inspect," ++
-    " create, or modify files or run commands." ++
-    " Be terse. No preamble. No filler.\n\n";
+    " Available tools: `read` (read files), `write`" ++
+    " (write files), and `bash` (run shell commands)." ++
+    " Use tools whenever file or command work is needed." ++
+    "\n\n" ++
+    "Instruction files:" ++
+    " Follow `AGENTS.md` instructions for files you touch;" ++
+    " deeper `AGENTS.md` files override broader ones.";
 
 const build_prompt = preamble ++
-    "You are in BUILD mode." ++
-    " Write working code. Implement solutions directly." ++
-    " Use tools to read existing code before editing." ++
-    " Show diffs or full files as appropriate." ++
-    " Prefer small, correct changes over large rewrites.";
+    " You are in BUILD mode." ++
+    " Implement code directly when needed." ++
+    " Read existing code before editing." ++
+    " Keep changes consistent with local style." ++
+    " Avoid unrelated refactors.";
 const plan_prompt = preamble ++
-    "You are in PLAN mode." ++
-    " Outline steps, trade-offs, and approach." ++
-    " Do NOT write implementation code." ++
-    " Use tools to read files when you need context." ++
-    " Keep plans short and actionable.";
+    " You are in PLAN mode." ++
+    " Provide short, actionable plans with trade-offs." ++
+    " Do not output implementation code." ++
+    " Read files when context is needed.";
 
 fn system_prompt(mode: Mode) []const u8 {
     return switch (mode) {
@@ -46,6 +57,8 @@ fn system_prompt(mode: Mode) []const u8 {
 pub const SendOptions = struct {
     streaming: bool = false,
     stream_output: ?std.fs.File = null,
+    on_first_stream_delta: ?*const fn (*anyopaque) void = null,
+    on_first_stream_delta_ctx: ?*anyopaque = null,
 };
 
 pub const Harness = struct {
@@ -57,16 +70,17 @@ pub const Harness = struct {
     model: []const u8,
     mode: Mode,
     system_text: []const u8,
+    skills_text: []u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
         api_key: []const u8,
         base_url: []const u8,
-    ) Harness {
+    ) !Harness {
         std.debug.assert(api_key.len > 0);
         std.debug.assert(base_url.len > 0);
 
-        return .{
+        var result = Harness{
             .backing_allocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
             .messages = std.ArrayList(types.Message).empty,
@@ -75,12 +89,20 @@ pub const Harness = struct {
             .model = default_model,
             .mode = .build,
             .system_text = build_prompt,
+            .skills_text = try skills.load_system_suffix(
+                allocator,
+            ),
         };
+        errdefer allocator.free(result.skills_text);
+
+        try result.rebuild_system_text();
+        return result;
     }
 
     pub fn deinit(self: *Harness) void {
         self.messages.deinit(self.arena.allocator());
         self.arena.deinit();
+        self.backing_allocator.free(self.skills_text);
     }
 
     pub fn getMode(self: *const Harness) Mode {
@@ -99,7 +121,7 @@ pub const Harness = struct {
 
     pub fn setMode(self: *Harness, mode: Mode) !void {
         self.mode = mode;
-        self.system_text = system_prompt(mode);
+        try self.rebuild_system_text();
         try self.ensure_system_message();
 
         std.debug.assert(self.system_text.len > 0);
@@ -117,11 +139,11 @@ pub const Harness = struct {
         model: []const u8,
         messages: []const types.Message,
     ) !void {
-        self.reset_state();
+        try self.reset_state();
 
         const a = self.arena.allocator();
         self.mode = mode;
-        self.system_text = system_prompt(mode);
+        try self.rebuild_system_text();
         self.model = try a.dupe(u8, model);
 
         for (messages) |m| {
@@ -190,6 +212,8 @@ pub const Harness = struct {
                 self.base_url,
                 self.model,
                 options.stream_output,
+                options.on_first_stream_delta,
+                options.on_first_stream_delta_ctx,
             );
         }
         return openrouter.fetch_message(
@@ -201,7 +225,7 @@ pub const Harness = struct {
         );
     }
 
-    fn reset_state(self: *Harness) void {
+    fn reset_state(self: *Harness) !void {
         self.messages.deinit(self.arena.allocator());
         self.arena.deinit();
 
@@ -211,7 +235,22 @@ pub const Harness = struct {
         self.messages = std.ArrayList(types.Message).empty;
         self.model = default_model;
         self.mode = .build;
-        self.system_text = build_prompt;
+        try self.rebuild_system_text();
+    }
+
+    fn rebuild_system_text(self: *Harness) !void {
+        const base = system_prompt(self.mode);
+        if (self.skills_text.len == 0) {
+            self.system_text = base;
+            return;
+        }
+
+        const a = self.arena.allocator();
+        self.system_text = try std.fmt.allocPrint(
+            a,
+            "{s}\n\n{s}",
+            .{ base, self.skills_text },
+        );
     }
 
     fn ensure_system_message(self: *Harness) !void {

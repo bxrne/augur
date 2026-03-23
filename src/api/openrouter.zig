@@ -15,6 +15,9 @@ const ToolCallBuilder = struct {
 const StreamState = struct {
     allocator: std.mem.Allocator,
     output_file: ?std.fs.File,
+    on_first_stream_delta: ?*const fn (*anyopaque) void,
+    on_first_stream_delta_ctx: ?*anyopaque,
+    first_stream_delta_emitted: bool,
     buffer: std.ArrayList(u8),
     content: std.ArrayList(u8),
     tool_calls: std.ArrayList(ToolCallBuilder),
@@ -25,10 +28,15 @@ const StreamState = struct {
     fn init(
         allocator: std.mem.Allocator,
         output_file: ?std.fs.File,
+        on_first_stream_delta: ?*const fn (*anyopaque) void,
+        on_first_stream_delta_ctx: ?*anyopaque,
     ) StreamState {
         return .{
             .allocator = allocator,
             .output_file = output_file,
+            .on_first_stream_delta = on_first_stream_delta,
+            .on_first_stream_delta_ctx = on_first_stream_delta_ctx,
+            .first_stream_delta_emitted = false,
             .buffer = .empty,
             .content = .empty,
             .tool_calls = .empty,
@@ -157,6 +165,7 @@ const StreamState = struct {
 
     fn append_content(self: *StreamState, text: []const u8) !void {
         if (text.len == 0) return;
+        self.mark_first_stream_delta();
         try self.content.appendSlice(self.allocator, text);
         if (self.output_file) |file| {
             try file.writeAll(text);
@@ -168,11 +177,23 @@ const StreamState = struct {
         value: std.json.Value,
     ) !void {
         if (value != .array) return;
+        if (value.array.items.len > 0) {
+            self.mark_first_stream_delta();
+        }
 
         for (value.array.items) |tc_val| {
             if (tc_val != .object) continue;
             try self.accumulate_tool_call(tc_val.object);
         }
+    }
+
+    fn mark_first_stream_delta(self: *StreamState) void {
+        if (self.first_stream_delta_emitted) return;
+        self.first_stream_delta_emitted = true;
+
+        const callback = self.on_first_stream_delta orelse return;
+        const ctx = self.on_first_stream_delta_ctx orelse return;
+        callback(ctx);
     }
 
     fn accumulate_tool_call(
@@ -570,6 +591,8 @@ pub fn stream_message(
     base_url: []const u8,
     model: []const u8,
     output_file: ?std.fs.File,
+    on_first_stream_delta: ?*const fn (*anyopaque) void,
+    on_first_stream_delta_ctx: ?*anyopaque,
 ) !types.Message {
     std.debug.assert(api_key.len > 0);
     std.debug.assert(model.len > 0);
@@ -592,7 +615,12 @@ pub fn stream_message(
     var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();
 
-    var state = StreamState.init(allocator, output_file);
+    var state = StreamState.init(
+        allocator,
+        output_file,
+        on_first_stream_delta,
+        on_first_stream_delta_ctx,
+    );
     defer state.deinit();
 
     var sink = StreamSink.init(&state);

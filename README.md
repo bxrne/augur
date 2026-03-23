@@ -58,6 +58,16 @@ Inside the REPL:
 
 Prompts are prefixed with `mode>` (e.g. `plan>`) and assistant responses with `model@mode>`.
 
+### Instruction files
+
+Augur now detects repository skill guidance and appends it to the system prompt:
+
+- `SKILLS.md`
+- `SKILLS/*/SKILL.md`
+- `.skills/*/SKILL.md`
+
+When skills are present, the assistant is instructed to read relevant `SKILL.md` files before implementation.
+
 ## Environment variables
 
 - `OPENROUTER_API_KEY` (required)

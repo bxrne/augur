@@ -109,6 +109,7 @@ pub fn run_prompt(
             session,
             prompt,
             stdout,
+            options.is_tty,
             options.use_color,
             show_prefix,
         );
@@ -124,13 +125,39 @@ pub fn run_prompt(
     );
 }
 
+const StreamSpinnerCtx = struct {
+    spinner: *spinner_mod.Spinner,
+};
+
+fn stop_stream_spinner(ctx_ptr: *anyopaque) void {
+    const ctx: *StreamSpinnerCtx = @ptrCast(@alignCast(ctx_ptr));
+    ctx.spinner.stop();
+}
+
 fn run_prompt_streaming(
     session: *harness.Harness,
     prompt: []const u8,
     stdout: std.fs.File,
+    is_tty: bool,
     use_color: bool,
     show_prefix: bool,
 ) !void {
+    var s = spinner_mod.Spinner.init();
+    var spinner_ctx = StreamSpinnerCtx{ .spinner = &s };
+
+    var on_first_stream_delta: ?*const fn (*anyopaque) void = null;
+    var on_first_stream_delta_ctx: ?*anyopaque = null;
+
+    if (is_tty) {
+        const phrase = spinner_mod.pick_status_phrase();
+        const stderr = std.fs.File.stderr();
+        const spinner_use_color = use_color and stderr.isTty();
+        try s.start(stderr, phrase, spinner_use_color);
+        on_first_stream_delta = stop_stream_spinner;
+        on_first_stream_delta_ctx = @ptrCast(&spinner_ctx);
+    }
+    defer s.stop();
+
     if (show_prefix) {
         try display.write_assistant_prefix(
             stdout,
@@ -141,6 +168,8 @@ fn run_prompt_streaming(
     _ = try session.send(prompt, .{
         .streaming = true,
         .stream_output = stdout,
+        .on_first_stream_delta = on_first_stream_delta,
+        .on_first_stream_delta_ctx = on_first_stream_delta_ctx,
     });
     if (show_prefix) {
         try stdout.writeAll("\n");
