@@ -18,6 +18,13 @@ This project started as the CodeCrafters course "Build your own Claude Code."
 zig build
 ```
 
+### Install
+
+```bash 
+bash -lc 'set -euo pipefail; INSTALL_DIR="${AUGUR_INSTALL_DIR:-$HOME/.local/bin}"; mkdir -p "$INSTALL_DIR"; zig build >/dev/null 2>&1 || { echo "Build failed"; exit 1; }; BIN_PATH="zig-out/bin/augur"; if [ ! -f "$BIN_PATH" ]; then echo "Binary not found at $BIN_PATH"; exit 1; fi; cp -f "$BIN_PATH" "$INSTALL_DIR/augur" && echo "augur installed to $INSTALL_DIR/augur"; case ":$PATH:" in *":$INSTALL_DIR:"*) ;; *) echo "Add to PATH: export PATH=\"$INSTALL_DIR:\$PATH\"";; esac'
+```
+
+
 ## Run a single prompt
 
 ```sh
