@@ -34,15 +34,6 @@ pub fn run(
     try store.sync_active_from_session(session);
     try store.save();
 
-    try display.write_repl_header(
-        stdout,
-        options.use_color,
-        session.getMode(),
-        session.getModel(),
-        store.active_name(),
-        options.streaming,
-    );
-
     var turn: u32 = 0;
     while (turn < limits.max_repl_turns) : (turn += 1) {
         try display.write_prompt(
@@ -76,6 +67,18 @@ pub fn run(
                     continue;
                 },
                 .quit => break,
+                .send_prompt => |prompt| {
+                    try run_prompt(
+                        session,
+                        prompt,
+                        stdout,
+                        options,
+                        true,
+                    );
+                    try store.sync_active_from_session(session);
+                    try store.save();
+                    continue;
+                },
             }
         }
 
@@ -129,7 +132,12 @@ fn run_prompt_streaming(
     show_prefix: bool,
 ) !void {
     if (show_prefix) {
-        try display.write_assistant_prefix(stdout, use_color);
+        try display.write_assistant_prefix(
+            stdout,
+            use_color,
+            session.getModel(),
+            session.getMode(),
+        );
     }
     _ = try session.send(prompt, .{
         .streaming = true,
@@ -161,7 +169,12 @@ fn run_prompt_buffered(
     s.stop();
 
     if (show_prefix) {
-        try display.write_assistant_prefix(stdout, use_color);
+        try display.write_assistant_prefix(
+            stdout,
+            use_color,
+            session.getModel(),
+            session.getMode(),
+        );
     }
     try stdout.writeAll(response);
     if (show_prefix) {

@@ -7,9 +7,10 @@ const harness = @import("harness.zig");
 const display = @import("../ui/display.zig");
 const store_mod = @import("conversation_store.zig");
 
-pub const Result = enum {
+pub const Result = union(enum) {
     handled,
     quit,
+    send_prompt: []const u8,
 };
 
 /// Dispatch a "/" command. Returns `.quit` when the user wants
@@ -58,6 +59,9 @@ pub fn dispatch(
     }
     if (std.mem.eql(u8, cmd, "convos")) {
         return handle_convos(store, stdout, use_color);
+    }
+    if (std.mem.eql(u8, cmd, "init")) {
+        return handle_init(stdout, use_color);
     }
     if (std.mem.eql(u8, cmd, "quit")) return .quit;
     if (std.mem.eql(u8, cmd, "help")) {
@@ -226,6 +230,24 @@ fn handle_convos(
     return .handled;
 }
 
+fn handle_init(
+    stdout: std.fs.File,
+    use_color: bool,
+) !Result {
+    _ = stdout;
+    _ = use_color;
+    return .{
+        .send_prompt =
+            "Inspect this project (read key files, check " ++
+            "the directory structure) and create an " ++
+            "AGENTS.md in the repository root. It should " ++
+            "document: the project purpose, language and " ++
+            "framework conventions, code style notes, " ++
+            "testing approach, and directory layout. " ++
+            "Be concise and accurate based on what you find.",
+    };
+}
+
 fn handle_help(
     stdout: std.fs.File,
     use_color: bool,
@@ -239,6 +261,7 @@ fn handle_help(
         "  /new [name]    - create + switch conversation",
         "  /switch <name> - switch conversation",
         "  /convos        - list conversations",
+        "  /init          - create AGENTS.md",
         "  /quit          - leave the REPL",
     };
     for (lines) |l| {

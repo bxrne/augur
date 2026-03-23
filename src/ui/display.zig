@@ -34,77 +34,33 @@ pub fn write_status_line(
     try file.writeAll("\n");
 }
 
-/// Print the REPL banner with current session state.
-pub fn write_repl_header(
+/// Write the compact status bar shown above each prompt.
+pub fn write_status_bar(
     file: std.fs.File,
     use_color: bool,
-    mode: types.Mode,
-    model: []const u8,
     active_conversation: []const u8,
     streaming: bool,
-) !void {
-    try write_header_field(
-        file,
-        use_color,
-        "zip • convo",
-        active_conversation,
-        null,
-    );
-    try write_header_field(
-        file,
-        use_color,
-        "mode",
-        types.mode_label(mode),
-        mode,
-    );
-    try write_header_field(
-        file,
-        use_color,
-        "model",
-        model,
-        null,
-    );
-    try write_header_field(
-        file,
-        use_color,
-        "streaming",
-        if (streaming) "on" else "off",
-        null,
-    );
-    try write_header_field(
-        file,
-        use_color,
-        "commands",
-        "/help /quit",
-        null,
-    );
-}
-
-fn write_header_field(
-    file: std.fs.File,
-    use_color: bool,
-    label_text: []const u8,
-    value: []const u8,
-    mode_opt: ?types.Mode,
 ) !void {
     if (use_color) {
         try file.writeAll(Ansi.border);
     }
-    try file.writeAll("│ ");
+    try file.writeAll("[");
     if (use_color) {
-        try file.writeAll(Ansi.dim);
+        try file.writeAll(Ansi.label);
     }
-    try file.writeAll(label_text);
-    try file.writeAll(": ");
+    try file.writeAll(active_conversation);
     if (use_color) {
-        try file.writeAll(Ansi.reset);
-        if (mode_opt) |mode| {
-            try file.writeAll(mode_color(mode));
-        } else {
-            try file.writeAll(Ansi.label);
-        }
+        try file.writeAll(Ansi.border);
     }
-    try file.writeAll(value);
+    try file.writeAll("] streaming=");
+    if (use_color) {
+        try file.writeAll(Ansi.label);
+    }
+    try file.writeAll(if (streaming) "on" else "off");
+    if (use_color) {
+        try file.writeAll(Ansi.border);
+    }
+    try file.writeAll(" /help /quit");
     if (use_color) {
         try file.writeAll(Ansi.reset);
     }
@@ -138,13 +94,21 @@ pub fn write_prompt(
     }
 }
 
-/// Write the assistant response prefix ("> ").
+/// Write the assistant response prefix as "model@mode> ".
 pub fn write_assistant_prefix(
     file: std.fs.File,
     use_color: bool,
+    model: []const u8,
+    mode: types.Mode,
 ) !void {
     if (use_color) {
         try file.writeAll(Ansi.assistant);
+    }
+    try file.writeAll(model);
+    try file.writeAll("@");
+    try file.writeAll(types.mode_label(mode));
+    if (use_color) {
+        try file.writeAll(Ansi.prompt);
     }
     try file.writeAll("> ");
     if (use_color) {
