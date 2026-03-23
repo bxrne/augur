@@ -5,7 +5,7 @@ OpenRouter, supports tool calling, and ships with a simple REPL.
 
 This project started as the CodeCrafters course "Build your own Claude Code."
 
-![./demo.png]()
+![./demo.png](./demo.png)
 
 ## Requirements
 
