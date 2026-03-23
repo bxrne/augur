@@ -1,8 +1,7 @@
 # augur
 
 `augur` is a tiny Claude-style assistant client written in Zig. It talks to
-OpenRouter, supports tool calling, and ships with a simple REPL.
-
+OpenRouter, supports tool calling, and ships with a simple REPL. 
 This project started as the CodeCrafters course "Build your own Claude Code."
 
 ![./demo.png](./demo.png)
@@ -24,15 +23,11 @@ zig build
 bash -lc 'set -euo pipefail; INSTALL_DIR="${AUGUR_INSTALL_DIR:-$HOME/.local/bin}"; mkdir -p "$INSTALL_DIR"; zig build >/dev/null 2>&1 || { echo "Build failed"; exit 1; }; BIN_PATH="zig-out/bin/augur"; if [ ! -f "$BIN_PATH" ]; then echo "Binary not found at $BIN_PATH"; exit 1; fi; cp -f "$BIN_PATH" "$INSTALL_DIR/augur" && echo "augur installed to $INSTALL_DIR/augur"; case ":$PATH:" in *":$INSTALL_DIR:"*) ;; *) echo "Add to PATH: export PATH=\"$INSTALL_DIR:\$PATH\"";; esac'
 ```
 
-
 ## Run prompt(s)
 
 ```sh
 # streams by default
 OPENROUTER_API_KEY=... zig build run -- -p "Say hello"
-
-# buffered output (shows a spinner in TTYs)
-OPENROUTER_API_KEY=... zig build run -- -p "Say hello" --no-stream
 
 # queue multiple prompts in order
 OPENROUTER_API_KEY=... zig build run -- -p "step 1" -p "step 2"
@@ -46,12 +41,10 @@ OPENROUTER_API_KEY=... zig build run
 
 Type `/quit` to leave the REPL.
 
-Streaming is on by default; pass `--no-stream` to buffer responses. The REPL
-uses ANSI colors when stdout is a TTY and starts in **plan** mode.
+ The REPL uses ANSI colors when stdout is a TTY and starts in **plan** mode.
 Conversations are persisted to `./augur/conversations.json` and switching
 conversations restores their message history into the active context buffer.
-After each response, augur prints a dimmed usage line with input/output tokens,
-total tokens, context-window usage %, and remaining context %.
+
 
 ### Slash commands
 
@@ -60,7 +53,7 @@ Inside the REPL:
 - `/plan` switches to plan mode (high-level steps, no code).
 - `/build` switches to build mode (implementation + code).
 - `/pair` switches to pair mode (direction-first pair programming + code).
-- `/model` shows the current model.
+- `/model` shows the current OpenRouter model.
 - `/model <id>` changes the OpenRouter model.
 - `/new [name]` creates and switches to a new conversation.
 - `/switch <name>` switches to a saved conversation (loads its history into context).
@@ -69,7 +62,6 @@ Inside the REPL:
 - `/quit` exits the REPL.
 - `/help` shows the command list.
 
-Prompts are prefixed with `mode>` (e.g. `plan>`) and assistant responses with `model@mode>`.
 
 ### Instruction files
 

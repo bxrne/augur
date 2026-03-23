@@ -1,8 +1,9 @@
-/// Entry point for the augur CLI assistant.
+/// CLI entry: parse args, wire OpenRouter credentials into `Harness`, then
+/// either run queued `-p` prompts or the interactive REPL.
 const std = @import("std");
-const cli_args = @import("app/cli_args.zig");
-const harness = @import("app/harness.zig");
-const repl = @import("app/repl.zig");
+const cli_args = @import("cli/args.zig");
+const harness = @import("lib/harness.zig");
+const repl = @import("cli/repl.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -12,8 +13,10 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    const api_key = std.posix.getenv("OPENROUTER_API_KEY") orelse
-        @panic("OPENROUTER_API_KEY is not set");
+    const api_key = std.posix.getenv("OPENROUTER_API_KEY") orelse {
+        std.debug.print("Error: OPENROUTER_API_KEY environment variable is not set\n", .{});
+        return error.MissingApiKey;
+    };
     const base_url = std.posix.getenv("OPENROUTER_BASE_URL") orelse
         "https://openrouter.ai/api/v1";
 
@@ -31,7 +34,6 @@ pub fn main() !void {
     const ropts = repl.ReplOptions{
         .is_tty = is_tty,
         .use_color = is_tty,
-        .streaming = options.streaming,
     };
 
     if (options.has_prompts()) {

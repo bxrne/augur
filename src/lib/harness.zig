@@ -1,14 +1,10 @@
 /// Session harness: manages messages, mode, model, and drives
 /// the send/tool-call loop.
 const std = @import("std");
-const types = @import("../core/types.zig");
-const openrouter = @import("../api/openrouter.zig");
-const toolset = @import("../api/toolset.zig");
-const msg = @import("../core/message_pool.zig");
+const types = @import("types.zig");
+const openrouter = @import("../providers/openrouter.zig");
+const toolset = @import("toolset.zig");
 const skills = @import("skills.zig");
-
-pub const Mode = types.Mode;
-pub const mode_label = types.mode_label;
 
 pub const default_model = "anthropic/claude-haiku-4.5";
 
@@ -47,16 +43,37 @@ const plan_prompt = preamble ++
     " Read files when context is needed.";
 const pair_prompt = preamble ++
     " You are in PAIR mode." ++
-    " Act as a senior pair programmer: direct, concrete, and practical." ++
-    " Give actionable next steps with checkpoints, not vague advice." ++
-    " You may provide code, but prioritize helping the user drive." ++
-    " Prefer verifying behavior from local sources before recommending APIs:" ++
-    " inspect interfaces, read project code, run `--help`, and use `man` when available." ++
-    " For language docs, use local commands when possible (examples: `go doc`, `go help`, `zig build --help`, `zig env`, `rustc --help`, `python -m pydoc`)." ++
-    " If a local docs server is available for the stack, propose/start it with exact commands and summarize what you found." ++
-    " Structure responses as: (1) what you checked, (2) ordered path forward, (3) optional implementation patch.";
+    " Act as a senior pair programmer who protects the user's learning." ++
+    " Your job is to reduce friction without removing the struggle." ++
+    "\n\n" ++
+    "Core principle: the user builds the mental model, you reduce context-switching." ++
+    " Never write code the user hasn't reasoned through first." ++
+    " When the user knows what the code should do, help them move fast." ++
+    " When they don't, slow down: ask what they think should happen," ++
+    " point them to the right documentation or man page, and let them wrestle with it." ++
+    "\n\n" ++
+    "Workflow:" ++
+    " (1) Clarify intent — confirm you understand what the user is trying to learn or build." ++
+    " (2) Check local sources first — inspect interfaces, read project code," ++
+    " run `--help`, use `man`, or language-native docs" ++
+    " (`go doc`, `zig build --help`, `rustc --explain`, `python -m pydoc`)." ++
+    " (3) Give direction, not solutions — provide the next 1-3 concrete steps" ++
+    " with checkpoints the user can verify themselves." ++
+    " (4) Only provide code when the user has articulated what it should do" ++
+    " and can verify the result. Prefer minimal patches over full implementations." ++
+    "\n\n" ++
+    "Anti-patterns to avoid:" ++
+    " - Generating a complete solution when the user said 'I'm not sure how to...'." ++
+    " - Agreeing with the user's approach when it has a flaw (be direct about tradeoffs)." ++
+    " - Skipping the research step and jumping straight to code." ++
+    " - Providing more context than the user needs right now." ++
+    "\n\n" ++
+    "Structure responses as:" ++
+    " (1) what you checked or verified," ++
+    " (2) ordered path forward (1-3 steps with verification points)," ++
+    " (3) optional minimal patch (only when the user is driving).";
 
-fn system_prompt(mode: Mode) []const u8 {
+fn system_prompt(mode: types.Mode) []const u8 {
     return switch (mode) {
         .build => build_prompt,
         .plan => plan_prompt,
@@ -64,13 +81,20 @@ fn system_prompt(mode: Mode) []const u8 {
     };
 }
 
+/// Lets callers steer streaming: optional TTY/file for deltas and a hook when the
+/// first token arrives (e.g. to hide spinners) without hard-wiring UI into the harness.
 pub const SendOptions = struct {
-    streaming: bool = false,
     stream_output: ?std.fs.File = null,
+    /// Fires on the first delta of any kind (content or tool call); used to stop spinners.
     on_first_stream_delta: ?*const fn (*anyopaque) void = null,
     on_first_stream_delta_ctx: ?*anyopaque = null,
+    /// Fires only on the first visible content token; used to write the model prefix.
+    on_first_content: ?*const fn (*anyopaque) void = null,
+    on_first_content_ctx: ?*anyopaque = null,
 };
 
+/// Aggregates usage across every API round-trip inside one `send` (tool loops can
+/// hit the API many times before returning).
 pub const TurnUsage = struct {
     available: bool = false,
     input_tokens: u64 = 0,
@@ -81,6 +105,8 @@ pub const TurnUsage = struct {
     context_left_tenths_pct: u16 = 1000,
 };
 
+/// Owns an arena allocator: all chat messages and duplicated strings live there so one
+/// reset frees the entire transcript without per-message bookkeeping.
 pub const Harness = struct {
     backing_allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -88,7 +114,7 @@ pub const Harness = struct {
     api_key: []const u8,
     base_url: []const u8,
     model: []const u8,
-    mode: Mode,
+    mode: types.Mode,
     system_text: []const u8,
     skills_text: []u8,
     last_turn_usage: TurnUsage,
@@ -108,8 +134,8 @@ pub const Harness = struct {
             .api_key = api_key,
             .base_url = base_url,
             .model = default_model,
-            .mode = .build,
-            .system_text = build_prompt,
+            .mode = .plan,
+            .system_text = plan_prompt,
             .skills_text = try skills.load_system_suffix(
                 allocator,
             ),
@@ -127,25 +153,25 @@ pub const Harness = struct {
         self.backing_allocator.free(self.skills_text);
     }
 
-    pub fn getMode(self: *const Harness) Mode {
+    pub fn get_mode(self: *const Harness) types.Mode {
         return self.mode;
     }
 
-    pub fn getModel(self: *const Harness) []const u8 {
+    pub fn get_model(self: *const Harness) []const u8 {
         return self.model;
     }
 
-    pub fn latestUsage(self: *const Harness) TurnUsage {
+    pub fn latest_usage(self: *const Harness) TurnUsage {
         return self.last_turn_usage;
     }
 
-    pub fn messagesSlice(
+    pub fn messages_slice(
         self: *const Harness,
     ) []const types.Message {
         return self.messages.items;
     }
 
-    pub fn setMode(self: *Harness, mode: Mode) !void {
+    pub fn set_mode(self: *Harness, mode: types.Mode) !void {
         self.mode = mode;
         try self.rebuild_system_text();
         try self.ensure_system_message();
@@ -153,15 +179,15 @@ pub const Harness = struct {
         std.debug.assert(self.system_text.len > 0);
     }
 
-    pub fn setModel(self: *Harness, model: []const u8) !void {
+    pub fn set_model(self: *Harness, model: []const u8) !void {
         std.debug.assert(model.len > 0);
         const a = self.arena.allocator();
         self.model = try a.dupe(u8, model);
     }
 
-    pub fn loadConversation(
+    pub fn load_conversation(
         self: *Harness,
-        mode: Mode,
+        mode: types.Mode,
         model: []const u8,
         messages: []const types.Message,
     ) !void {
@@ -173,7 +199,7 @@ pub const Harness = struct {
         self.model = try a.dupe(u8, model);
 
         for (messages) |m| {
-            try self.messages.append(a, try msg.clone(a, m));
+            try self.messages.append(a, try types.clone(a, m));
         }
 
         try self.ensure_system_message();
@@ -194,7 +220,7 @@ pub const Harness = struct {
         const a = self.arena.allocator();
         try self.ensure_system_message();
         try self.messages.append(a, .{
-            .role = "user",
+            .role = .user,
             .content = try a.dupe(u8, prompt),
         });
 
@@ -267,10 +293,15 @@ pub const Harness = struct {
                     a,
                 );
                 try self.messages.append(a, .{
-                    .role = "tool",
+                    .role = .tool,
                     .content = output,
                     .tool_call_id = tc.id,
                 });
+            }
+
+            // Separate tool-call stderr output from the next streamed response
+            if (options.stream_output) |out| {
+                try out.writeAll("\n");
             }
         }
 
@@ -282,27 +313,22 @@ pub const Harness = struct {
         a: std.mem.Allocator,
         options: SendOptions,
     ) !openrouter.Response {
-        if (options.streaming) {
-            return openrouter.stream_message(
-                a,
-                self.messages.items,
-                self.api_key,
-                self.base_url,
-                self.model,
-                options.stream_output,
-                options.on_first_stream_delta,
-                options.on_first_stream_delta_ctx,
-            );
-        }
-        return openrouter.fetch_message(
+        return openrouter.stream_message(
             a,
             self.messages.items,
             self.api_key,
             self.base_url,
             self.model,
+            options.stream_output,
+            options.on_first_stream_delta,
+            options.on_first_stream_delta_ctx,
+            options.on_first_content,
+            options.on_first_content_ctx,
         );
     }
 
+    /// Heuristic per-vendor limits for context budgeting; OpenRouter does not return
+    /// the true window in responses, so we approximate from the model id prefix.
     fn context_window_tokens_for_model(model: []const u8) u64 {
         if (std.mem.startsWith(u8, model, "anthropic/")) {
             return 200_000;
@@ -319,6 +345,8 @@ pub const Harness = struct {
         return 200_000;
     }
 
+    /// Expresses fill ratio as tenths of a percent (0–1000) so status math stays
+    /// integer-only while still showing finer than whole-percent resolution.
     fn context_used_tenths(
         input_tokens: u64,
         context_window: u64,
@@ -330,6 +358,8 @@ pub const Harness = struct {
         return @intCast(@min(scaled, 1000));
     }
 
+    /// Drops the arena and starts a fresh one so loading or clearing a conversation
+    /// reclaims all message memory in one shot instead of freeing each clone.
     fn reset_state(self: *Harness) !void {
         self.messages.deinit(self.arena.allocator());
         self.arena.deinit();
@@ -344,6 +374,8 @@ pub const Harness = struct {
         try self.rebuild_system_text();
     }
 
+    /// Composes the mode-specific base prompt with any repository skills blurb so
+    /// `system_text` always reflects the current mode and discovered SKILL.md files.
     fn rebuild_system_text(self: *Harness) !void {
         const base = system_prompt(self.mode);
         if (self.skills_text.len == 0) {
@@ -359,6 +391,8 @@ pub const Harness = struct {
         );
     }
 
+    /// Keeps `messages[0]` aligned with `system_text` so mode or skills changes apply
+    /// on the very next request without stale system content in the transcript.
     fn ensure_system_message(self: *Harness) !void {
         if (self.system_text.len == 0) return;
 
@@ -367,20 +401,16 @@ pub const Harness = struct {
 
         if (self.messages.items.len == 0) {
             try self.messages.append(a, .{
-                .role = "system",
+                .role = .system,
                 .content = content,
             });
             std.debug.assert(self.messages.items.len > 0);
             return;
         }
 
-        if (!std.mem.eql(
-            u8,
-            self.messages.items[0].role,
-            "system",
-        )) {
+        if (self.messages.items[0].role != .system) {
             try self.messages.insert(a, 0, .{
-                .role = "system",
+                .role = .system,
                 .content = content,
             });
             std.debug.assert(self.messages.items.len > 0);

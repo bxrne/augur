@@ -1,37 +1,38 @@
-/// Persistent conversation storage.
-///
-/// Conversations are saved as JSON in `augur/conversations.json`
-/// and restored on REPL startup. Each conversation holds a
-/// snapshot of its messages, mode, and model.
+//! Persists named chat sessions to `augur/conversations.json` and keeps the harness
+//! in sync when switching or creating conversations.
 const std = @import("std");
-const types = @import("../core/types.zig");
+const types = @import("types.zig");
 const harness = @import("harness.zig");
-const limits = @import("../core/limits.zig");
-const msg = @import("../core/message_pool.zig");
 
+const max_conversation_name_attempts: u32 = 4096;
+const max_conversations_file_bytes: u32 = 32 * 1024 * 1024;
+
+/// One conversation's serialised shape in JSON: metadata plus a cloned message list.
 const ConversationSnapshot = struct {
     name: []const u8,
-    mode: harness.Mode,
+    mode: types.Mode,
     model: []const u8,
     messages: []types.Message,
 };
 
+/// Top-level envelope written to disk: format version, active name, and all snapshots.
 const ConversationsFile = struct {
     version: u32 = 1,
     active: []const u8,
     conversations: []ConversationSnapshot,
 };
 
+/// A single named session with its own mode, model, and message history (heap-owned).
 pub const Conversation = struct {
     name: []const u8,
-    mode: harness.Mode,
+    mode: types.Mode,
     model: []const u8,
     messages: std.ArrayList(types.Message),
 
     pub fn init(
         allocator: std.mem.Allocator,
         name: []const u8,
-        mode: harness.Mode,
+        mode: types.Mode,
         model: []const u8,
     ) !Conversation {
         std.debug.assert(name.len > 0);
@@ -51,7 +52,7 @@ pub const Conversation = struct {
     pub fn deinit(self: *Conversation, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.model);
-        msg.free_slice(allocator, self.messages.items);
+        types.free_slice(allocator, self.messages.items);
         self.messages.deinit(allocator);
     }
 };
@@ -100,7 +101,7 @@ pub const ConversationStore = struct {
         const contents = cwd.readFileAlloc(
             allocator,
             file_path,
-            limits.max_conversations_file_bytes,
+            max_conversations_file_bytes,
         ) catch |err| switch (err) {
             error.FileNotFound => return init_default(allocator),
             else => return err,
@@ -145,7 +146,7 @@ pub const ConversationStore = struct {
             for (snap.messages) |m| {
                 try conv.messages.append(
                     allocator,
-                    try msg.clone(allocator, m),
+                    try types.clone(allocator, m),
                 );
             }
 
@@ -216,7 +217,7 @@ pub const ConversationStore = struct {
                 conv.messages.items.len,
             );
             for (conv.messages.items, 0..) |m, j| {
-                msgs[j] = try msg.clone(allocator, m);
+                msgs[j] = try types.clone(allocator, m);
             }
 
             convs[i] = .{
@@ -237,7 +238,6 @@ pub const ConversationStore = struct {
         };
     }
 
-
     pub fn active_name(self: *const ConversationStore) []const u8 {
         std.debug.assert(
             self.active_index < self.conversations.items.len,
@@ -254,14 +254,13 @@ pub const ConversationStore = struct {
         return &self.conversations.items[self.active_index];
     }
 
-
     /// Push the active conversation's state into the harness.
     pub fn apply_active(
         self: *ConversationStore,
         session: *harness.Harness,
     ) !void {
         const active = self.active_conversation();
-        try session.loadConversation(
+        try session.load_conversation(
             active.mode,
             active.model,
             active.messages.items,
@@ -274,19 +273,18 @@ pub const ConversationStore = struct {
         session: *const harness.Harness,
     ) !void {
         const active = self.active_conversation();
-        active.mode = session.getMode();
-        try msg.replace_owned_string(
+        active.mode = session.get_mode();
+        try types.replace_owned_string(
             self.allocator,
             &active.model,
-            session.getModel(),
+            session.get_model(),
         );
-        try msg.replace_list(
+        try types.replace_list(
             self.allocator,
             &active.messages,
-            session.messagesSlice(),
+            session.messages_slice(),
         );
     }
-
 
     /// Switch to a named conversation, returning false if not found.
     pub fn switch_conversation(
@@ -315,25 +313,21 @@ pub const ConversationStore = struct {
     ) ![]const u8 {
         try self.sync_active_from_session(session);
 
-        const name = requested_name orelse
+        const name = if (requested_name) |n|
+            try self.allocator.dupe(u8, n)
+        else
             try self.generate_name();
-        const should_free = requested_name == null;
-        defer if (should_free) self.allocator.free(name);
+        defer self.allocator.free(name);
 
         if (self.find_index_by_name(name) != null) {
             return error.ConversationAlreadyExists;
-        }
-        if (self.conversations.items.len >=
-            limits.max_conversations)
-        {
-            return error.TooManyConversations;
         }
 
         var conv = try Conversation.init(
             self.allocator,
             name,
             .plan,
-            session.getModel(),
+            session.get_model(),
         );
         errdefer conv.deinit(self.allocator);
 
@@ -347,7 +341,8 @@ pub const ConversationStore = struct {
         return self.active_name();
     }
 
-    /// Generate a unique "chat-N" name, bounded by the safety limit.
+    /// Picks `chat-{n}` starting from `len+1`, bumping `n` until unused so auto names
+    /// never collide with existing conversations.
     fn generate_name(
         self: *const ConversationStore,
     ) ![]const u8 {
@@ -356,7 +351,7 @@ pub const ConversationStore = struct {
         );
         var attempt: u32 = 0;
 
-        while (attempt < limits.max_conversation_name_attempts) {
+        while (attempt < max_conversation_name_attempts) {
             const name = try std.fmt.allocPrint(
                 self.allocator,
                 "chat-{d}",
@@ -386,16 +381,51 @@ pub const ConversationStore = struct {
     }
 };
 
-/// Count non-system messages in a slice.
+/// Counts user/assistant/tool turns for status UI; omits system because that slot is
+/// synthetic and not part of the conversational back-and-forth the user cares about.
 pub fn context_message_count(
     messages: []const types.Message,
 ) usize {
     var count: usize = 0;
     for (messages) |m| {
-        if (!std.mem.eql(u8, m.role, "system")) {
+        if (m.role != .system) {
             count += 1;
         }
     }
     std.debug.assert(count <= messages.len);
     return count;
+}
+
+test "context_message_count skips system messages" {
+    const messages = [_]types.Message{
+        .{ .role = .system, .content = "sys" },
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .content = "hello" },
+    };
+    try std.testing.expectEqual(@as(usize, 2), context_message_count(&messages));
+}
+
+test "context_message_count empty slice" {
+    const messages = [_]types.Message{};
+    try std.testing.expectEqual(@as(usize, 0), context_message_count(&messages));
+}
+
+test "Conversation init and deinit" {
+    const allocator = std.testing.allocator;
+    var conv = try Conversation.init(allocator, "test", .plan, "model-1");
+    defer conv.deinit(allocator);
+
+    try std.testing.expectEqualStrings("test", conv.name);
+    try std.testing.expectEqual(types.Mode.plan, conv.mode);
+    try std.testing.expectEqualStrings("model-1", conv.model);
+    try std.testing.expectEqual(@as(usize, 0), conv.messages.items.len);
+}
+
+test "ConversationStore init_default" {
+    const allocator = std.testing.allocator;
+    var store = try ConversationStore.init_default(allocator);
+    defer store.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), store.conversations.items.len);
+    try std.testing.expectEqualStrings("default", store.active_name());
 }

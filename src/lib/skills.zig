@@ -1,12 +1,9 @@
-/// Discovery and prompt wiring for repository-local SKILLS files.
+//! Finds `SKILL.md` files under the process cwd (`SKILLS/`, `.skills/`, and root
+//! `SKILLS.md`) so the harness can tell the model what local skills exist.
 const std = @import("std");
 
-/// Build a system-prompt suffix that advertises discovered skills.
-///
-/// Supported locations:
-/// - `SKILLS.md`
-/// - `SKILLS/*/SKILL.md`
-/// - `.skills/*/SKILL.md`
+/// Returns allocator-owned text appended to the system prompt listing discovered
+/// skills so the model knows to read the right `SKILL.md` before acting.
 pub fn load_system_suffix(
     allocator: std.mem.Allocator,
 ) ![]u8 {
@@ -29,7 +26,7 @@ pub fn load_system_suffix(
     );
 
     if (!has_skills_md and skill_paths.items.len == 0) {
-        return allocator.alloc(u8, 0);
+        return "";
     }
 
     var out = std.ArrayList(u8).empty;
@@ -95,12 +92,12 @@ fn collect_skill_files(
                     "{s}/{s}/SKILL.md",
                     .{ base_dir, entry.name },
                 );
-                errdefer allocator.free(path);
 
                 if (!file_exists(path)) {
                     allocator.free(path);
                     continue;
                 }
+                errdefer allocator.free(path);
                 try paths.append(allocator, path);
             },
             else => {},

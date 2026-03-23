@@ -1,22 +1,41 @@
-/// Slash-command dispatcher for the REPL.
-///
-/// Each command is a small function so the dispatcher stays well
-/// under the 70-line limit.
+/// Slash commands parsed from REPL input (`/plan`, `/switch`, …): thin dispatch
+/// into session and conversation store updates.
 const std = @import("std");
-const harness = @import("harness.zig");
-const display = @import("../ui/display.zig");
-const store_mod = @import("conversation_store.zig");
+const harness = @import("../lib/harness.zig");
+const types = @import("../lib/types.zig");
+const display = @import("display.zig");
+const conversation = @import("../lib/conversation.zig");
 
+/// Outcome of handling a `/…` line: consume locally, exit the REPL, or hand a
+/// synthetic user prompt to the model (`/init`).
 pub const Result = union(enum) {
     handled,
     quit,
     send_prompt: []const u8,
 };
 
-/// Dispatch a "/" command. Returns `.quit` when the user wants
-/// to leave the REPL.
+/// Parsed command name; `switch_cmd` maps the user-visible `/switch` because
+/// `switch` is reserved in Zig.
+const Command = enum {
+    plan,
+    build,
+    pair,
+    model,
+    new,
+    switch_cmd,
+    convos,
+    init,
+    quit,
+    help,
+    unknown,
+};
+
+fn parse_command(cmd: []const u8) Command {
+    return std.meta.stringToEnum(Command, cmd) orelse .unknown;
+}
+
 pub fn dispatch(
-    store: *store_mod.ConversationStore,
+    store: *conversation.ConversationStore,
     session: *harness.Harness,
     line: []const u8,
     stdout: std.fs.File,
@@ -26,67 +45,48 @@ pub fn dispatch(
     if (line[0] != '/') return .handled;
 
     var iter = std.mem.tokenizeScalar(u8, line[1..], ' ');
-    const cmd = iter.next() orelse {
+    const cmd_str = iter.next() orelse {
         try display.write_status_line(
             stdout,
             use_color,
-            "Commands: /plan /build /pair /model" ++ " /new /switch /convos /quit /help",
+            "Commands: /plan /build /pair /model /new /switch /convos /quit /help",
         );
         return .handled;
     };
 
-    if (std.mem.eql(u8, cmd, "plan")) {
-        return handle_mode(session, stdout, use_color, .plan);
-    }
-    if (std.mem.eql(u8, cmd, "build")) {
-        return handle_mode(session, stdout, use_color, .build);
-    }
-    if (std.mem.eql(u8, cmd, "pair")) {
-        return handle_mode(session, stdout, use_color, .pair);
-    }
-    if (std.mem.eql(u8, cmd, "model")) {
-        return handle_model(session, &iter, stdout, use_color);
-    }
-    if (std.mem.eql(u8, cmd, "new")) {
-        return handle_new(store, session, &iter, stdout, use_color);
-    }
-    if (std.mem.eql(u8, cmd, "switch")) {
-        return handle_switch(
-            store,
-            session,
-            &iter,
-            stdout,
-            use_color,
-        );
-    }
-    if (std.mem.eql(u8, cmd, "convos")) {
-        return handle_convos(store, stdout, use_color);
-    }
-    if (std.mem.eql(u8, cmd, "init")) {
-        return handle_init(stdout, use_color);
-    }
-    if (std.mem.eql(u8, cmd, "quit")) return .quit;
-    if (std.mem.eql(u8, cmd, "help")) {
-        return handle_help(stdout, use_color);
-    }
+    const cmd = parse_command(cmd_str);
 
-    var buf: [256]u8 = undefined;
-    const out = try std.fmt.bufPrint(
-        &buf,
-        "Unknown command: /{s}. Try /help.",
-        .{cmd},
-    );
-    try display.write_status_line(stdout, use_color, out);
-    return .handled;
+    return switch (cmd) {
+        .plan => handle_mode(session, stdout, use_color, .plan),
+        .build => handle_mode(session, stdout, use_color, .build),
+        .pair => handle_mode(session, stdout, use_color, .pair),
+        .model => handle_model(session, &iter, stdout, use_color),
+        .new => handle_new(store, session, &iter, stdout, use_color),
+        .switch_cmd => handle_switch(store, session, &iter, stdout, use_color),
+        .convos => handle_convos(store, stdout, use_color),
+        .init => handle_init(),
+        .quit => .quit,
+        .help => handle_help(stdout, use_color),
+        .unknown => {
+            var buf: [256]u8 = @splat(0);
+            const out = try std.fmt.bufPrint(
+                &buf,
+                "Unknown command: /{s}. Try /help.",
+                .{cmd_str},
+            );
+            try display.write_status_line(stdout, use_color, out);
+            return .handled;
+        },
+    };
 }
 
 fn handle_mode(
     session: *harness.Harness,
     stdout: std.fs.File,
     use_color: bool,
-    mode: harness.Mode,
+    mode: types.Mode,
 ) !Result {
-    try session.setMode(mode);
+    try session.set_mode(mode);
     const label = switch (mode) {
         .plan => "Mode set to plan.",
         .build => "Mode set to build.",
@@ -104,10 +104,10 @@ fn handle_model(
     stdout: std.fs.File,
     use_color: bool,
 ) !Result {
-    var buf: [256]u8 = undefined;
+    var buf: [256]u8 = @splat(0);
 
     if (iter.next()) |model| {
-        try session.setModel(model);
+        try session.set_model(model);
         const out = try std.fmt.bufPrint(
             &buf,
             "Model set to {s}.",
@@ -118,7 +118,7 @@ fn handle_model(
         const out = try std.fmt.bufPrint(
             &buf,
             "Current model: {s}",
-            .{session.getModel()},
+            .{session.get_model()},
         );
         try display.write_status_line(stdout, use_color, out);
     }
@@ -126,7 +126,7 @@ fn handle_model(
 }
 
 fn handle_new(
-    store: *store_mod.ConversationStore,
+    store: *conversation.ConversationStore,
     session: *harness.Harness,
     iter: *TokenIterator,
     stdout: std.fs.File,
@@ -148,9 +148,9 @@ fn handle_new(
         return err;
     };
 
-    var buf: [256]u8 = undefined;
-    const count = store_mod.context_message_count(
-        session.messagesSlice(),
+    var buf: [256]u8 = @splat(0);
+    const count = conversation.context_message_count(
+        session.messages_slice(),
     );
     const out = try std.fmt.bufPrint(
         &buf,
@@ -162,7 +162,7 @@ fn handle_new(
 }
 
 fn handle_switch(
-    store: *store_mod.ConversationStore,
+    store: *conversation.ConversationStore,
     session: *harness.Harness,
     iter: *TokenIterator,
     stdout: std.fs.File,
@@ -187,9 +187,9 @@ fn handle_switch(
         return .handled;
     }
 
-    var buf: [256]u8 = undefined;
-    const count = store_mod.context_message_count(
-        session.messagesSlice(),
+    var buf: [256]u8 = @splat(0);
+    const count = conversation.context_message_count(
+        session.messages_slice(),
     );
     const out = try std.fmt.bufPrint(
         &buf,
@@ -201,7 +201,7 @@ fn handle_switch(
 }
 
 fn handle_convos(
-    store: *store_mod.ConversationStore,
+    store: *conversation.ConversationStore,
     stdout: std.fs.File,
     use_color: bool,
 ) !Result {
@@ -212,7 +212,7 @@ fn handle_convos(
     );
 
     for (store.conversations.items, 0..) |conv, i| {
-        var buf: [512]u8 = undefined;
+        var buf: [512]u8 = @splat(0);
         const marker = if (i == store.active_index) "*" else " ";
         const out = try std.fmt.bufPrint(
             &buf,
@@ -220,7 +220,7 @@ fn handle_convos(
             .{
                 marker,
                 conv.name,
-                harness.mode_label(conv.mode),
+                types.mode_label(conv.mode),
                 conv.model,
                 conv.messages.items.len,
             },
@@ -230,12 +230,7 @@ fn handle_convos(
     return .handled;
 }
 
-fn handle_init(
-    stdout: std.fs.File,
-    use_color: bool,
-) !Result {
-    _ = stdout;
-    _ = use_color;
+fn handle_init() !Result {
     return .{
         .send_prompt = "Inspect this project (read key files, check " ++
             "the directory structure) and create an " ++

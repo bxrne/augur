@@ -1,16 +1,11 @@
-/// OpenRouter HTTP transport: buffered and streaming chat
-/// completions.
+/// SSE framing for OpenAI-style streamed chat: splits `data:` lines, parses JSON
+/// deltas, and merges partial assistant content and tool-call chunks.
 const std = @import("std");
-const types = @import("../core/types.zig");
-const toolset = @import("toolset.zig");
-const limits = @import("../core/limits.zig");
+const types = @import("../lib/types.zig");
 
-const ToolCallBuilder = struct {
-    id: ?[]const u8 = null,
-    tool_type: ?[]const u8 = null,
-    name: std.ArrayList(u8) = .empty,
-    arguments: std.ArrayList(u8) = .empty,
-};
+/// Hard cap on the in-memory line buffer so a stuck or malicious stream cannot
+/// grow `ArrayList` without bound.
+const max_stream_buffer_bytes: u32 = 8 * 1024 * 1024;
 
 pub const Usage = struct {
     input_tokens: u64 = 0,
@@ -29,12 +24,26 @@ pub const Response = struct {
     usage: Usage = .{},
 };
 
-const StreamState = struct {
+/// One tool call is split across many SSE events; fields accumulate until
+/// `finish_response` can emit a complete `types.ToolCall`.
+const ToolCallBuilder = struct {
+    id: ?[]const u8 = null,
+    tool_type: ?[]const u8 = null,
+    name: std.ArrayList(u8) = .empty,
+    arguments: std.ArrayList(u8) = .empty,
+};
+
+/// Holds streaming parse state: raw buffer, assistant text, and per-index tool
+/// builders until the provider signals end-of-stream.
+pub const StreamState = struct {
     allocator: std.mem.Allocator,
     output_file: ?std.fs.File,
     on_first_stream_delta: ?*const fn (*anyopaque) void,
     on_first_stream_delta_ctx: ?*anyopaque,
     first_stream_delta_emitted: bool,
+    on_first_content: ?*const fn (*anyopaque) void,
+    on_first_content_ctx: ?*anyopaque,
+    first_content_emitted: bool,
     buffer: std.ArrayList(u8),
     content: std.ArrayList(u8),
     tool_calls: std.ArrayList(ToolCallBuilder),
@@ -43,11 +52,13 @@ const StreamState = struct {
     failure: ?anyerror = null,
     usage: Usage = .{},
 
-    fn init(
+    pub fn init(
         allocator: std.mem.Allocator,
         output_file: ?std.fs.File,
         on_first_stream_delta: ?*const fn (*anyopaque) void,
         on_first_stream_delta_ctx: ?*anyopaque,
+        on_first_content: ?*const fn (*anyopaque) void,
+        on_first_content_ctx: ?*anyopaque,
     ) StreamState {
         return .{
             .allocator = allocator,
@@ -55,13 +66,16 @@ const StreamState = struct {
             .on_first_stream_delta = on_first_stream_delta,
             .on_first_stream_delta_ctx = on_first_stream_delta_ctx,
             .first_stream_delta_emitted = false,
+            .on_first_content = on_first_content,
+            .on_first_content_ctx = on_first_content_ctx,
+            .first_content_emitted = false,
             .buffer = .empty,
             .content = .empty,
             .tool_calls = .empty,
         };
     }
 
-    fn deinit(self: *StreamState) void {
+    pub fn deinit(self: *StreamState) void {
         self.buffer.deinit(self.allocator);
         self.content.deinit(self.allocator);
         for (self.tool_calls.items) |*b| {
@@ -71,10 +85,9 @@ const StreamState = struct {
         self.tool_calls.deinit(self.allocator);
     }
 
-    /// Append raw bytes and process complete lines.
-    fn consume(self: *StreamState, data: []const u8) !void {
+    pub fn consume(self: *StreamState, data: []const u8) !void {
         if (self.buffer.items.len + data.len >
-            limits.max_stream_buffer_bytes)
+            max_stream_buffer_bytes)
         {
             return error.StreamBufferOverflow;
         }
@@ -83,7 +96,6 @@ const StreamState = struct {
         try self.drain_lines();
     }
 
-    /// Process all complete newline-terminated lines in the buffer.
     fn drain_lines(self: *StreamState) !void {
         while (true) {
             const nl = std.mem.indexOfScalar(
@@ -188,10 +200,22 @@ const StreamState = struct {
     fn append_content(self: *StreamState, text: []const u8) !void {
         if (text.len == 0) return;
         self.mark_first_stream_delta();
+        self.mark_first_content();
         try self.content.appendSlice(self.allocator, text);
         if (self.output_file) |file| {
             try file.writeAll(text);
         }
+    }
+
+    /// Fires once per StreamState when the first visible content token arrives,
+    /// distinct from mark_first_stream_delta which also fires for tool-call deltas.
+    fn mark_first_content(self: *StreamState) void {
+        if (self.first_content_emitted) return;
+        self.first_content_emitted = true;
+
+        const callback = self.on_first_content orelse return;
+        const ctx = self.on_first_content_ctx orelse return;
+        callback(ctx);
     }
 
     fn handle_tool_calls(
@@ -224,10 +248,6 @@ const StreamState = struct {
     ) !void {
         const index_val = obj.get("index") orelse return;
         const index = parse_index(index_val) orelse return;
-
-        if (index >= limits.max_tool_calls) {
-            return error.TooManyToolCalls;
-        }
 
         const builder = try self.ensure_tool_call(index);
 
@@ -295,10 +315,9 @@ const StreamState = struct {
         return &self.tool_calls.items[index];
     }
 
-    /// Build the final `Response` from accumulated state.
-    fn finish_response(self: *StreamState) !Response {
+    pub fn finish_response(self: *StreamState) !Response {
         var message = types.Message{
-            .role = "assistant",
+            .role = .assistant,
             .content = "",
         };
 
@@ -348,11 +367,13 @@ const StreamState = struct {
     }
 };
 
-const StreamSink = struct {
+/// Bridges `StreamState.consume` to `std.io.Writer` so `http.Client.fetch` can
+/// stream the response body without a separate read loop type.
+pub const StreamSink = struct {
     state: *StreamState,
     writer: std.io.Writer,
 
-    fn init(state: *StreamState) StreamSink {
+    pub fn init(state: *StreamState) StreamSink {
         return .{
             .state = state,
             .writer = .{
@@ -399,8 +420,7 @@ const StreamSink = struct {
     }
 };
 
-/// Extract the delta object from a streaming response chunk.
-fn extract_delta(root: std.json.Value) ?std.json.Value {
+pub fn extract_delta(root: std.json.Value) ?std.json.Value {
     const choices = root.object.get("choices") orelse return null;
     if (choices != .array) return null;
     if (choices.array.items.len == 0) return null;
@@ -413,7 +433,7 @@ fn extract_delta(root: std.json.Value) ?std.json.Value {
     return delta;
 }
 
-fn parse_index(value: std.json.Value) ?usize {
+pub fn parse_index(value: std.json.Value) ?usize {
     return switch (value) {
         .integer => |v| if (v >= 0)
             @as(usize, @intCast(v))
@@ -443,7 +463,7 @@ fn parse_u64(value: std.json.Value) ?u64 {
     };
 }
 
-fn parse_usage_value(value: std.json.Value) Usage {
+pub fn parse_usage_value(value: std.json.Value) Usage {
     if (value != .object) return .{};
 
     const obj = value.object;
@@ -471,306 +491,4 @@ fn parse_usage_value(value: std.json.Value) Usage {
         .output_tokens = output,
         .total_tokens = total,
     };
-}
-
-fn build_chat_url(
-    allocator: std.mem.Allocator,
-    base_url: []const u8,
-) ![]const u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}/chat/completions",
-        .{base_url},
-    );
-}
-
-fn build_auth_header(
-    allocator: std.mem.Allocator,
-    api_key: []const u8,
-) ![]const u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "Bearer {s}",
-        .{api_key},
-    );
-}
-
-/// Send a non-streaming chat completion request.
-pub fn fetch_message(
-    allocator: std.mem.Allocator,
-    messages: []const types.Message,
-    api_key: []const u8,
-    base_url: []const u8,
-    model: []const u8,
-) !Response {
-    std.debug.assert(api_key.len > 0);
-    std.debug.assert(model.len > 0);
-
-    var body_out = try build_request_body(
-        allocator,
-        messages,
-        model,
-        false,
-    );
-    defer body_out.deinit();
-    const body = body_out.written();
-
-    const url_str = try build_chat_url(allocator, base_url);
-    defer allocator.free(url_str);
-
-    const auth = try build_auth_header(allocator, api_key);
-    defer allocator.free(auth);
-
-    var client: std.http.Client = .{ .allocator = allocator };
-    defer client.deinit();
-
-    var resp_out: std.io.Writer.Allocating = .init(allocator);
-    defer resp_out.deinit();
-
-    _ = try client.fetch(.{
-        .location = .{ .url = url_str },
-        .method = .POST,
-        .payload = body,
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = "application/json" },
-            .{ .name = "authorization", .value = auth },
-        },
-        .response_writer = &resp_out.writer,
-    });
-
-    return parse_fetch_response(allocator, resp_out.written());
-}
-
-fn parse_fetch_response(
-    allocator: std.mem.Allocator,
-    body: []const u8,
-) !Response {
-    const parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        allocator,
-        body,
-        .{},
-    );
-    defer parsed.deinit();
-
-    if (parsed.value.object.get("error")) |err_val| {
-        if (err_val.object.get("message")) |m| {
-            if (m == .string) {
-                std.debug.print(
-                    "OpenRouter error: {s}\n",
-                    .{m.string},
-                );
-            }
-        } else {
-            std.debug.print(
-                "OpenRouter error response: {s}\n",
-                .{body},
-            );
-        }
-        return error.ApiError;
-    }
-
-    const choices = parsed.value.object.get("choices") orelse {
-        std.debug.print(
-            "Unexpected response: {s}\n",
-            .{body},
-        );
-        return error.MissingChoices;
-    };
-    if (choices.array.items.len == 0) {
-        std.debug.print(
-            "Unexpected response: {s}\n",
-            .{body},
-        );
-        return error.MissingChoices;
-    }
-
-    const msg_val = choices.array.items[0].object.get(
-        "message",
-    ).?;
-
-    var usage: Usage = .{};
-    if (parsed.value.object.get("usage")) |usage_val| {
-        usage = parse_usage_value(usage_val);
-    }
-
-    return .{
-        .message = try parse_message_value(allocator, msg_val),
-        .usage = usage,
-    };
-}
-
-fn parse_message_value(
-    allocator: std.mem.Allocator,
-    val: std.json.Value,
-) !types.Message {
-    var message = types.Message{
-        .role = "assistant",
-        .content = "",
-    };
-
-    if (val.object.get("content")) |c| {
-        if (c == .string) {
-            message.content = try allocator.dupe(u8, c.string);
-        }
-    }
-
-    if (val.object.get("tool_calls")) |tc_val| {
-        if (tc_val == .array) {
-            message.tool_calls = try parse_tool_calls(
-                allocator,
-                tc_val.array.items,
-            );
-        }
-    }
-
-    return message;
-}
-
-fn parse_tool_calls(
-    allocator: std.mem.Allocator,
-    items: []const std.json.Value,
-) ![]types.ToolCall {
-    const calls = try allocator.alloc(types.ToolCall, items.len);
-
-    for (items, 0..) |tc, i| {
-        const obj = tc.object;
-        const fn_obj = obj.get("function").?.object;
-
-        calls[i] = .{
-            .id = try allocator.dupe(
-                u8,
-                obj.get("id").?.string,
-            ),
-            .type = try allocator.dupe(
-                u8,
-                obj.get("type").?.string,
-            ),
-            .function = .{
-                .name = try allocator.dupe(
-                    u8,
-                    fn_obj.get("name").?.string,
-                ),
-                .arguments = try allocator.dupe(
-                    u8,
-                    fn_obj.get("arguments").?.string,
-                ),
-            },
-        };
-    }
-
-    return calls;
-}
-
-/// Send a streaming chat completion request.
-pub fn stream_message(
-    allocator: std.mem.Allocator,
-    messages: []const types.Message,
-    api_key: []const u8,
-    base_url: []const u8,
-    model: []const u8,
-    output_file: ?std.fs.File,
-    on_first_stream_delta: ?*const fn (*anyopaque) void,
-    on_first_stream_delta_ctx: ?*anyopaque,
-) !Response {
-    std.debug.assert(api_key.len > 0);
-    std.debug.assert(model.len > 0);
-
-    var body_out = try build_request_body(
-        allocator,
-        messages,
-        model,
-        true,
-    );
-    defer body_out.deinit();
-    const body = body_out.written();
-
-    const url_str = try build_chat_url(allocator, base_url);
-    defer allocator.free(url_str);
-
-    const auth = try build_auth_header(allocator, api_key);
-    defer allocator.free(auth);
-
-    var client: std.http.Client = .{ .allocator = allocator };
-    defer client.deinit();
-
-    var state = StreamState.init(
-        allocator,
-        output_file,
-        on_first_stream_delta,
-        on_first_stream_delta_ctx,
-    );
-    defer state.deinit();
-
-    var sink = StreamSink.init(&state);
-
-    _ = client.fetch(.{
-        .location = .{ .url = url_str },
-        .method = .POST,
-        .payload = body,
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = "application/json" },
-            .{ .name = "authorization", .value = auth },
-        },
-        .response_writer = &sink.writer,
-    }) catch |err| {
-        if (err == error.WriteFailed) {
-            if (state.failure) |f| return f;
-        }
-        return err;
-    };
-
-    if (state.error_message) |e| {
-        std.debug.print("OpenRouter error: {s}\n", .{e});
-        return error.ApiError;
-    }
-
-    return state.finish_response();
-}
-
-fn build_request_body(
-    allocator: std.mem.Allocator,
-    messages: []const types.Message,
-    model: []const u8,
-    stream: bool,
-) !std.io.Writer.Allocating {
-    var out: std.io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-
-    var jw: std.json.Stringify = .{
-        .writer = &out.writer,
-        .options = .{ .emit_null_optional_fields = false },
-    };
-
-    try jw.beginObject();
-
-    try jw.objectField("model");
-    try jw.write(model);
-
-    if (stream) {
-        try jw.objectField("stream");
-        try jw.write(true);
-
-        try jw.objectField("stream_options");
-        try jw.beginObject();
-        try jw.objectField("include_usage");
-        try jw.write(true);
-        try jw.endObject();
-    }
-
-    try jw.objectField("messages");
-    try jw.beginArray();
-    for (messages) |m| {
-        try jw.write(m);
-    }
-    try jw.endArray();
-
-    try jw.objectField("tools");
-    try jw.beginArray();
-    try toolset.write_tool_definitions(&jw);
-    try jw.endArray();
-
-    try jw.endObject();
-
-    return out;
 }

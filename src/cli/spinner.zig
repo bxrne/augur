@@ -1,10 +1,12 @@
-/// Animated wait indicator for non-streaming waits.
-///
-/// The loop is bounded by `limits.max_spinner_ticks` so it
-/// cannot run forever even if the caller forgets to stop it.
+/// Indeterminate progress UI: the animation runs on a background thread and
+/// is meant to be attached to stderr so token streaming on stdout does not
+/// interleave with spinner frames.
 const std = @import("std");
-const limits = @import("../core/limits.zig");
 const display = @import("display.zig");
+
+/// ~120ms balances smooth motion against wakeups; shorter sleeps spin hot
+/// without much perceptible gain on a TTY.
+const frame_delay_ns: u64 = 120 * 1_000_000;
 
 pub const Spinner = struct {
     stop_flag: std.atomic.Value(bool),
@@ -25,7 +27,6 @@ pub const Spinner = struct {
         };
     }
 
-    /// Begin the animation on a background thread.
     pub fn start(
         self: *Spinner,
         stdout: std.fs.File,
@@ -46,7 +47,6 @@ pub const Spinner = struct {
         );
     }
 
-    /// Join the background thread and clear the animation line.
     pub fn stop(self: *Spinner) void {
         if (!self.active) return;
 
@@ -54,14 +54,13 @@ pub const Spinner = struct {
         if (self.thread) |thread| {
             thread.join();
         }
-        self.stdout.writeAll("\r\x1b[2K") catch {
-            // Terminal write failed; nothing useful to do.
-        };
+        self.stdout.writeAll("\r\x1b[2K") catch {};
         self.active = false;
     }
 };
 
-/// Pick a deterministic status phrase based on wall-clock time.
+/// Picks from a fixed phrase list using the wall clock so the line changes
+/// between runs without pulling in a RNG or storing state.
 pub fn pick_status_phrase() []const u8 {
     const phrases = [_][]const u8{
         "compiling response",
@@ -71,11 +70,13 @@ pub fn pick_status_phrase() []const u8 {
         "turning coffee into tokens",
     };
     const now = std.time.nanoTimestamp();
-    const positive: u128 = @intCast(if (now < 0) -now else now);
+    const positive: u128 = @intCast(@as(i128, now));
     const idx: usize = @intCast(positive % phrases.len);
     return phrases[idx];
 }
 
+/// Secondary lines swapped in after the base message so long waits still feel
+/// animated instead of frozen on one string.
 const rotating_phrases = [_][]const u8{
     "burning tokens",
     "works on my machine",
@@ -83,6 +84,8 @@ const rotating_phrases = [_][]const u8{
     "waiting for next token",
 };
 
+/// Punctuation cycle on every frame: cheap motion when the phrase itself is
+/// unchanged for several seconds.
 const suffix_pulse = [_][]const u8{
     "",
     ".",
@@ -92,15 +95,14 @@ const suffix_pulse = [_][]const u8{
     ".",
 };
 
-/// Bounded animation loop executed on a background thread.
 fn spinner_loop(s: *Spinner) void {
     var tick: u32 = 0;
 
-    while (tick < limits.max_spinner_ticks) : (tick += 1) {
+    while (true) : (tick +%= 1) {
         if (s.stop_flag.load(.acquire)) break;
 
         render_frame(s, tick) catch break;
-        std.Thread.sleep(limits.spinner_frame_delay_ns);
+        std.Thread.sleep(frame_delay_ns);
     }
 }
 
@@ -119,11 +121,13 @@ fn phrase_for_tick(base: []const u8, tick: u32) []const u8 {
     return rotating_phrases[slot % rotating_phrases.len];
 }
 
+/// Maps a 3s "hold" preference into spinner ticks so phrase rotation stays
+/// human-paced relative to `frame_delay_ns`.
 fn phrase_hold_ticks() usize {
     const hold_ns: u64 = 3 * std.time.ns_per_s;
     const ticks =
-        (hold_ns + limits.spinner_frame_delay_ns - 1) /
-        limits.spinner_frame_delay_ns;
+        (hold_ns + frame_delay_ns - 1) /
+        frame_delay_ns;
     return @intCast(if (ticks == 0) 1 else ticks);
 }
 
@@ -132,20 +136,47 @@ fn pulse_suffix_for_tick(tick: u32) []const u8 {
     return suffix_pulse[idx];
 }
 
-/// Render a single text pulse frame to stdout.
+test "pick_status_phrase returns a non-empty string" {
+    const phrase = pick_status_phrase();
+    try std.testing.expect(phrase.len > 0);
+}
+
+test "phrase_for_tick returns base phrase at tick 0" {
+    const result = phrase_for_tick("custom", 0);
+    try std.testing.expectEqualStrings("custom", result);
+}
+
+test "phrase_for_tick without base uses rotating" {
+    const result = phrase_for_tick("", 0);
+    try std.testing.expect(result.len > 0);
+}
+
+test "pulse_suffix_for_tick cycles through suffixes" {
+    const s0 = pulse_suffix_for_tick(0);
+    const s1 = pulse_suffix_for_tick(1);
+    const s3 = pulse_suffix_for_tick(3);
+    try std.testing.expectEqualStrings("", s0);
+    try std.testing.expectEqualStrings(".", s1);
+    try std.testing.expectEqualStrings("...", s3);
+}
+
+test "phrase_hold_ticks is at least 1" {
+    try std.testing.expect(phrase_hold_ticks() >= 1);
+}
+
 fn render_frame(s: *Spinner, tick: u32) !void {
     const phrase = phrase_for_tick(s.message, tick);
     const suffix = pulse_suffix_for_tick(tick);
 
     try s.stdout.writeAll("\r\x1b[2K");
     if (s.use_color and tick % 8 < 6) {
-        try s.stdout.writeAll(display.Ansi.dim);
+        try s.stdout.writeAll(display.ansi.dim);
     }
 
     try s.stdout.writeAll(phrase);
     try s.stdout.writeAll(suffix);
 
     if (s.use_color) {
-        try s.stdout.writeAll(display.Ansi.reset);
+        try s.stdout.writeAll(display.ansi.reset);
     }
 }
