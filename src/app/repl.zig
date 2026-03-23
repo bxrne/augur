@@ -144,23 +144,24 @@ fn write_usage_line(
     const line = if (usage.available)
         try std.fmt.bufPrint(
             &buf,
-            "tokens in={d} out={d} total={d} ctx={d}.{d}% ({d}/{d}) turns<={d}",
+            "in={d} out={d} total={d} ctx_used={d}.{d}% ctx_left={d}.{d}% ({d}/{d})",
             .{
                 usage.input_tokens,
                 usage.output_tokens,
                 usage.total_tokens,
                 usage.context_used_tenths_pct / 10,
                 usage.context_used_tenths_pct % 10,
+                usage.context_left_tenths_pct / 10,
+                usage.context_left_tenths_pct % 10,
                 usage.input_tokens,
                 usage.context_window_tokens,
-                usage.dynamic_turn_cap,
             },
         )
     else
         try std.fmt.bufPrint(
             &buf,
-            "tokens unavailable (provider usage missing) turns<={d}",
-            .{usage.dynamic_turn_cap},
+            "tokens unavailable (provider usage missing; context-bound loop unavailable)",
+            .{},
         );
 
     if (use_color) {

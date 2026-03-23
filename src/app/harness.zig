@@ -5,7 +5,6 @@ const types = @import("../core/types.zig");
 const openrouter = @import("../api/openrouter.zig");
 const toolset = @import("../api/toolset.zig");
 const msg = @import("../core/message_pool.zig");
-const limits = @import("../core/limits.zig");
 const skills = @import("skills.zig");
 
 pub const Mode = types.Mode;
@@ -68,7 +67,7 @@ pub const TurnUsage = struct {
     total_tokens: u64 = 0,
     context_window_tokens: u64 = 0,
     context_used_tenths_pct: u16 = 0,
-    dynamic_turn_cap: u32 = limits.max_tool_turns,
+    context_left_tenths_pct: u16 = 1000,
 };
 
 pub const Harness = struct {
@@ -171,7 +170,7 @@ pub const Harness = struct {
 
     /// Send a user prompt and return the final assistant text.
     ///
-    /// Tool-call rounds are bounded and adapt to context usage.
+    /// Tool-call rounds continue while context space remains.
     pub fn send(
         self: *Harness,
         prompt: []const u8,
@@ -188,9 +187,6 @@ pub const Harness = struct {
             .content = try a.dupe(u8, prompt),
         });
 
-        var turn: u32 = 0;
-        var turn_cap: u32 = limits.max_tool_turns;
-
         var usage_seen = false;
         var cumulative_input: u64 = 0;
         var cumulative_output: u64 = 0;
@@ -201,7 +197,10 @@ pub const Harness = struct {
             self.model,
         );
 
-        while (turn < turn_cap) : (turn += 1) {
+        while (true) {
+            if (usage_seen and max_context_input >= context_window) {
+                return error.ContextWindowExhausted;
+            }
             const api_response = try self.fetch_response(
                 a,
                 options,
@@ -223,17 +222,12 @@ pub const Harness = struct {
                     max_context_input,
                     api_response.usage.input_tokens,
                 );
-
-                const context_tenths = context_used_tenths(
-                    max_context_input,
-                    context_window,
-                );
-                const adaptive_cap = dynamic_turn_cap_for_context(
-                    context_tenths,
-                );
-                turn_cap = @min(turn_cap, adaptive_cap);
             }
 
+            const used_tenths = context_used_tenths(
+                max_context_input,
+                context_window,
+            );
             self.last_turn_usage = .{
                 .available = usage_seen,
                 .input_tokens = cumulative_input,
@@ -243,16 +237,17 @@ pub const Harness = struct {
                 else
                     (cumulative_input + cumulative_output),
                 .context_window_tokens = context_window,
-                .context_used_tenths_pct = context_used_tenths(
-                    max_context_input,
-                    context_window,
-                ),
-                .dynamic_turn_cap = turn_cap,
+                .context_used_tenths_pct = used_tenths,
+                .context_left_tenths_pct = 1000 -| used_tenths,
             };
 
             const tool_calls = response.tool_calls orelse {
                 return response.content;
             };
+
+            if (!usage_seen) {
+                return error.ContextUsageUnavailable;
+            }
 
             for (tool_calls) |tc| {
                 const output = try toolset.call_tool(
@@ -268,7 +263,7 @@ pub const Harness = struct {
             }
         }
 
-        return error.TooManyTurns;
+        unreachable;
     }
 
     fn fetch_response(
@@ -322,16 +317,6 @@ pub const Harness = struct {
             (input_tokens * 1000 + context_window / 2) /
             context_window;
         return @intCast(@min(scaled, 1000));
-    }
-
-    fn dynamic_turn_cap_for_context(
-        context_used_tenths_pct: u16,
-    ) u32 {
-        if (context_used_tenths_pct >= 990) return 2;
-        if (context_used_tenths_pct >= 960) return 3;
-        if (context_used_tenths_pct >= 920) return 4;
-        if (context_used_tenths_pct >= 850) return 6;
-        return limits.max_tool_turns;
     }
 
     fn reset_state(self: *Harness) !void {

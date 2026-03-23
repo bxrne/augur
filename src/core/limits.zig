@@ -3,7 +3,6 @@
 /// Tiger Style mandates a limit on everything. Centralising
 /// constants here keeps the rest of the codebase consistent and
 /// makes it easy to audit every cap in one place.
-
 /// Maximum number of CLI arguments accepted.
 pub const max_args: u32 = 64;
 
@@ -39,9 +38,6 @@ pub const max_tool_output_bytes: u32 = 200 * 1024;
 
 /// Maximum bytes read from a single file via the read tool.
 pub const max_read_file_bytes: u32 = 10 * 1024 * 1024;
-
-/// Maximum tool-call rounds before the harness gives up.
-pub const max_tool_turns: u32 = 12;
 
 /// Spinner frame delay in nanoseconds.
 pub const spinner_frame_delay_ns: u64 = 120 * 1_000_000;

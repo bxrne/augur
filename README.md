@@ -25,7 +25,7 @@ bash -lc 'set -euo pipefail; INSTALL_DIR="${AUGUR_INSTALL_DIR:-$HOME/.local/bin}
 ```
 
 
-## Run a single prompt
+## Run prompt(s)
 
 ```sh
 # streams by default
@@ -33,6 +33,9 @@ OPENROUTER_API_KEY=... zig build run -- -p "Say hello"
 
 # buffered output (shows a spinner in TTYs)
 OPENROUTER_API_KEY=... zig build run -- -p "Say hello" --no-stream
+
+# queue multiple prompts in order
+OPENROUTER_API_KEY=... zig build run -- -p "step 1" -p "step 2"
 ```
 
 ## Start the REPL
@@ -48,7 +51,7 @@ uses ANSI colors when stdout is a TTY and starts in **plan** mode.
 Conversations are persisted to `./augur/conversations.json` and switching
 conversations restores their message history into the active context buffer.
 After each response, augur prints a dimmed usage line with input/output tokens,
-total tokens, context-window usage %, and the current adaptive tool-turn cap.
+total tokens, context-window usage %, and remaining context %.
 
 ### Slash commands
 
@@ -99,7 +102,7 @@ The assistant can call these tools:
 - [x] SKILLS discovery (`SKILLS.md`, `SKILLS/*/SKILL.md`, `.skills/*/SKILL.md`)
 - [x] Streaming wait indicator before first token
 - [x] Per-response token usage + context-window %
-- [x] Adaptive tool-turn cap based on context usage
+- [x] Context-bound tool loop (continues while context remains)
 - [ ] Scoped AGENTS.md loading by directory tree
 - [ ] Web search tool
 - [ ] Subagents

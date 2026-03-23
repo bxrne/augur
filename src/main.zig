@@ -34,14 +34,19 @@ pub fn main() !void {
         .streaming = options.streaming,
     };
 
-    if (options.prompt) |prompt| {
-        try repl.run_prompt(
-            &session,
-            prompt,
-            stdout,
-            ropts,
-            false,
-        );
+    if (options.has_prompts()) {
+        const prompts = options.prompt_slice();
+        const show_prefix = prompts.len > 1;
+
+        for (prompts) |prompt| {
+            try repl.run_prompt(
+                &session,
+                prompt,
+                stdout,
+                ropts,
+                show_prefix,
+            );
+        }
         return;
     }
 
