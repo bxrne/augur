@@ -12,6 +12,23 @@ const ToolCallBuilder = struct {
     arguments: std.ArrayList(u8) = .empty,
 };
 
+pub const Usage = struct {
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    total_tokens: u64 = 0,
+
+    pub fn has_data(self: Usage) bool {
+        return self.input_tokens > 0 or
+            self.output_tokens > 0 or
+            self.total_tokens > 0;
+    }
+};
+
+pub const Response = struct {
+    message: types.Message,
+    usage: Usage = .{},
+};
+
 const StreamState = struct {
     allocator: std.mem.Allocator,
     output_file: ?std.fs.File,
@@ -24,6 +41,7 @@ const StreamState = struct {
     done: bool = false,
     error_message: ?[]const u8 = null,
     failure: ?anyerror = null,
+    usage: Usage = .{},
 
     fn init(
         allocator: std.mem.Allocator,
@@ -126,6 +144,10 @@ const StreamState = struct {
         if (parsed.value.object.get("error")) |err_val| {
             try self.extract_error(err_val, payload);
             return;
+        }
+
+        if (parsed.value.object.get("usage")) |usage_val| {
+            self.usage = parse_usage_value(usage_val);
         }
 
         const delta = extract_delta(parsed.value) orelse return;
@@ -273,8 +295,8 @@ const StreamState = struct {
         return &self.tool_calls.items[index];
     }
 
-    /// Build the final `Message` from accumulated state.
-    fn finish_message(self: *StreamState) !types.Message {
+    /// Build the final `Response` from accumulated state.
+    fn finish_response(self: *StreamState) !Response {
         var message = types.Message{
             .role = "assistant",
             .content = "",
@@ -290,7 +312,10 @@ const StreamState = struct {
             message.tool_calls = try self.build_tool_calls();
         }
 
-        return message;
+        return .{
+            .message = message,
+            .usage = self.usage,
+        };
     }
 
     fn build_tool_calls(self: *StreamState) ![]types.ToolCall {
@@ -403,6 +428,51 @@ fn parse_index(value: std.json.Value) ?usize {
     };
 }
 
+fn parse_u64(value: std.json.Value) ?u64 {
+    return switch (value) {
+        .integer => |v| if (v >= 0)
+            @as(u64, @intCast(v))
+        else
+            null,
+        .float => |v| if (v >= 0)
+            @as(u64, @intFromFloat(v))
+        else
+            null,
+        .string => |t| std.fmt.parseInt(u64, t, 10) catch null,
+        else => null,
+    };
+}
+
+fn parse_usage_value(value: std.json.Value) Usage {
+    if (value != .object) return .{};
+
+    const obj = value.object;
+    const input = if (obj.get("prompt_tokens")) |v|
+        parse_u64(v) orelse 0
+    else if (obj.get("input_tokens")) |v|
+        parse_u64(v) orelse 0
+    else
+        0;
+
+    const output = if (obj.get("completion_tokens")) |v|
+        parse_u64(v) orelse 0
+    else if (obj.get("output_tokens")) |v|
+        parse_u64(v) orelse 0
+    else
+        0;
+
+    const total = if (obj.get("total_tokens")) |v|
+        parse_u64(v) orelse (input + output)
+    else
+        (input + output);
+
+    return .{
+        .input_tokens = input,
+        .output_tokens = output,
+        .total_tokens = total,
+    };
+}
+
 fn build_chat_url(
     allocator: std.mem.Allocator,
     base_url: []const u8,
@@ -432,7 +502,7 @@ pub fn fetch_message(
     api_key: []const u8,
     base_url: []const u8,
     model: []const u8,
-) !types.Message {
+) !Response {
     std.debug.assert(api_key.len > 0);
     std.debug.assert(model.len > 0);
 
@@ -474,7 +544,7 @@ pub fn fetch_message(
 fn parse_fetch_response(
     allocator: std.mem.Allocator,
     body: []const u8,
-) !types.Message {
+) !Response {
     const parsed = try std.json.parseFromSlice(
         std.json.Value,
         allocator,
@@ -518,7 +588,16 @@ fn parse_fetch_response(
     const msg_val = choices.array.items[0].object.get(
         "message",
     ).?;
-    return parse_message_value(allocator, msg_val);
+
+    var usage: Usage = .{};
+    if (parsed.value.object.get("usage")) |usage_val| {
+        usage = parse_usage_value(usage_val);
+    }
+
+    return .{
+        .message = try parse_message_value(allocator, msg_val),
+        .usage = usage,
+    };
 }
 
 fn parse_message_value(
@@ -593,7 +672,7 @@ pub fn stream_message(
     output_file: ?std.fs.File,
     on_first_stream_delta: ?*const fn (*anyopaque) void,
     on_first_stream_delta_ctx: ?*anyopaque,
-) !types.Message {
+) !Response {
     std.debug.assert(api_key.len > 0);
     std.debug.assert(model.len > 0);
 
@@ -646,7 +725,7 @@ pub fn stream_message(
         return error.ApiError;
     }
 
-    return state.finish_message();
+    return state.finish_response();
 }
 
 fn build_request_body(
@@ -671,6 +750,12 @@ fn build_request_body(
     if (stream) {
         try jw.objectField("stream");
         try jw.write(true);
+
+        try jw.objectField("stream_options");
+        try jw.beginObject();
+        try jw.objectField("include_usage");
+        try jw.write(true);
+        try jw.endObject();
     }
 
     try jw.objectField("messages");

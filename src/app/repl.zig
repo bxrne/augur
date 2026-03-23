@@ -134,6 +134,45 @@ fn stop_stream_spinner(ctx_ptr: *anyopaque) void {
     ctx.spinner.stop();
 }
 
+fn write_usage_line(
+    stdout: std.fs.File,
+    use_color: bool,
+    usage: harness.TurnUsage,
+) !void {
+    var buf: [256]u8 = undefined;
+
+    const line = if (usage.available)
+        try std.fmt.bufPrint(
+            &buf,
+            "tokens in={d} out={d} total={d} ctx={d}.{d}% ({d}/{d}) turns<={d}",
+            .{
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.total_tokens,
+                usage.context_used_tenths_pct / 10,
+                usage.context_used_tenths_pct % 10,
+                usage.input_tokens,
+                usage.context_window_tokens,
+                usage.dynamic_turn_cap,
+            },
+        )
+    else
+        try std.fmt.bufPrint(
+            &buf,
+            "tokens unavailable (provider usage missing) turns<={d}",
+            .{usage.dynamic_turn_cap},
+        );
+
+    if (use_color) {
+        try stdout.writeAll(display.Ansi.dim);
+    }
+    try stdout.writeAll(line);
+    if (use_color) {
+        try stdout.writeAll(display.Ansi.reset);
+    }
+    try stdout.writeAll("\n");
+}
+
 fn run_prompt_streaming(
     session: *harness.Harness,
     prompt: []const u8,
@@ -171,9 +210,13 @@ fn run_prompt_streaming(
         .on_first_stream_delta = on_first_stream_delta,
         .on_first_stream_delta_ctx = on_first_stream_delta_ctx,
     });
-    if (show_prefix) {
-        try stdout.writeAll("\n");
-    }
+    try stdout.writeAll("\n");
+
+    try write_usage_line(
+        stdout,
+        use_color,
+        session.latestUsage(),
+    );
 }
 
 fn run_prompt_buffered(
@@ -204,7 +247,11 @@ fn run_prompt_buffered(
         );
     }
     try stdout.writeAll(response);
-    if (show_prefix) {
-        try stdout.writeAll("\n");
-    }
+    try stdout.writeAll("\n");
+
+    try write_usage_line(
+        stdout,
+        use_color,
+        session.latestUsage(),
+    );
 }

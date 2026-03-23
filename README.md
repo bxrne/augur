@@ -40,6 +40,8 @@ Streaming is on by default; pass `--no-stream` to buffer responses. The REPL
 uses ANSI colors when stdout is a TTY and starts in **plan** mode.
 Conversations are persisted to `./augur/conversations.json` and switching
 conversations restores their message history into the active context buffer.
+After each response, augur prints a dimmed usage line with input/output tokens,
+total tokens, context-window usage %, and the current adaptive tool-turn cap.
 
 ### Slash commands
 
@@ -83,9 +85,14 @@ The assistant can call these tools:
 
 ## Roadmap
 
-- [x] Streamed responses 
+- [x] Streamed responses (default)
 - [x] Model choice
 - [x] Plan and Build modes
-- [ ] Conversation Mgmt
-- [ ] Web search tool 
+- [x] Conversation persistence + switching
+- [x] SKILLS discovery (`SKILLS.md`, `SKILLS/*/SKILL.md`, `.skills/*/SKILL.md`)
+- [x] Streaming wait indicator before first token
+- [x] Per-response token usage + context-window %
+- [x] Adaptive tool-turn cap based on context usage
+- [ ] Scoped AGENTS.md loading by directory tree
+- [ ] Web search tool
 - [ ] Subagents

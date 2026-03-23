@@ -1,4 +1,4 @@
-/// Animated spinner for non-streaming waits.
+/// Animated wait indicator for non-streaming waits.
 ///
 /// The loop is bounded by `limits.max_spinner_ticks` so it
 /// cannot run forever even if the caller forgets to stop it.
@@ -25,7 +25,7 @@ pub const Spinner = struct {
         };
     }
 
-    /// Begin the spinner animation on a background thread.
+    /// Begin the animation on a background thread.
     pub fn start(
         self: *Spinner,
         stdout: std.fs.File,
@@ -46,7 +46,7 @@ pub const Spinner = struct {
         );
     }
 
-    /// Join the background thread and clear the spinner line.
+    /// Join the background thread and clear the animation line.
     pub fn stop(self: *Spinner) void {
         if (!self.active) return;
 
@@ -79,58 +79,73 @@ pub fn pick_status_phrase() []const u8 {
 const rotating_phrases = [_][]const u8{
     "burning tokens",
     "works on my machine",
-    "convincing the compiler",
-    "chasing a race condition",
-    "aligning semicolons",
-    "rendering extra confidence",
+    "compiling confidence",
+    "waiting for next token",
 };
 
-const frames = [_][]const u8{ "|", "/", "-", "\\" };
+const suffix_pulse = [_][]const u8{
+    "",
+    ".",
+    "..",
+    "...",
+    "..",
+    ".",
+};
 
 /// Bounded animation loop executed on a background thread.
 fn spinner_loop(s: *Spinner) void {
-    var frame_index: u32 = 0;
     var tick: u32 = 0;
 
     while (tick < limits.max_spinner_ticks) : (tick += 1) {
         if (s.stop_flag.load(.acquire)) break;
 
-        render_frame(s, frame_index, tick) catch break;
-        frame_index = (frame_index + 1) % @as(u32, @intCast(frames.len));
+        render_frame(s, tick) catch break;
         std.Thread.sleep(limits.spinner_frame_delay_ns);
     }
 }
 
 fn phrase_for_tick(base: []const u8, tick: u32) []const u8 {
-    if (base.len > 0 and tick % 4 == 0) {
-        return base;
+    const step: usize = @intCast(tick);
+    const hold: usize = phrase_hold_ticks();
+    const slot = step / hold;
+
+    if (base.len > 0) {
+        const total = rotating_phrases.len + 1;
+        const pos = slot % total;
+        if (pos == 0) return base;
+        return rotating_phrases[pos - 1];
     }
-    const idx: usize = @intCast(tick % rotating_phrases.len);
-    return rotating_phrases[idx];
+
+    return rotating_phrases[slot % rotating_phrases.len];
 }
 
-/// Render a single spinner frame to stdout.
-fn render_frame(
-    s: *Spinner,
-    frame_index: u32,
-    tick: u32,
-) !void {
+fn phrase_hold_ticks() usize {
+    const hold_ns: u64 = 3 * std.time.ns_per_s;
+    const ticks =
+        (hold_ns + limits.spinner_frame_delay_ns - 1) /
+        limits.spinner_frame_delay_ns;
+    return @intCast(if (ticks == 0) 1 else ticks);
+}
+
+fn pulse_suffix_for_tick(tick: u32) []const u8 {
+    const idx: usize = @intCast(tick % suffix_pulse.len);
+    return suffix_pulse[idx];
+}
+
+/// Render a single text pulse frame to stdout.
+fn render_frame(s: *Spinner, tick: u32) !void {
     const phrase = phrase_for_tick(s.message, tick);
+    const suffix = pulse_suffix_for_tick(tick);
 
     try s.stdout.writeAll("\r\x1b[2K");
-    if (s.use_color) {
-        const color = switch (tick % 3) {
-            0 => display.Ansi.spinner,
-            1 => display.Ansi.status,
-            else => display.Ansi.prompt,
-        };
-        try s.stdout.writeAll(color);
+    if (s.use_color and tick % 8 < 6) {
+        try s.stdout.writeAll(display.Ansi.dim);
     }
-    try s.stdout.writeAll(frames[frame_index]);
-    try s.stdout.writeAll(" ");
+
     try s.stdout.writeAll(phrase);
+    try s.stdout.writeAll(suffix);
+
     if (s.use_color) {
         try s.stdout.writeAll(display.Ansi.reset);
     }
-    try s.stdout.writeAll("...");
 }

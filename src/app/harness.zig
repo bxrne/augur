@@ -61,6 +61,16 @@ pub const SendOptions = struct {
     on_first_stream_delta_ctx: ?*anyopaque = null,
 };
 
+pub const TurnUsage = struct {
+    available: bool = false,
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    total_tokens: u64 = 0,
+    context_window_tokens: u64 = 0,
+    context_used_tenths_pct: u16 = 0,
+    dynamic_turn_cap: u32 = limits.max_tool_turns,
+};
+
 pub const Harness = struct {
     backing_allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -71,6 +81,7 @@ pub const Harness = struct {
     mode: Mode,
     system_text: []const u8,
     skills_text: []u8,
+    last_turn_usage: TurnUsage,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -92,6 +103,7 @@ pub const Harness = struct {
             .skills_text = try skills.load_system_suffix(
                 allocator,
             ),
+            .last_turn_usage = .{},
         };
         errdefer allocator.free(result.skills_text);
 
@@ -111,6 +123,10 @@ pub const Harness = struct {
 
     pub fn getModel(self: *const Harness) []const u8 {
         return self.model;
+    }
+
+    pub fn latestUsage(self: *const Harness) TurnUsage {
+        return self.last_turn_usage;
     }
 
     pub fn messagesSlice(
@@ -155,13 +171,15 @@ pub const Harness = struct {
 
     /// Send a user prompt and return the final assistant text.
     ///
-    /// Runs up to `limits.max_tool_turns` tool-call rounds.
+    /// Tool-call rounds are bounded and adapt to context usage.
     pub fn send(
         self: *Harness,
         prompt: []const u8,
         options: SendOptions,
     ) ![]const u8 {
         std.debug.assert(prompt.len > 0);
+
+        self.last_turn_usage = .{};
 
         const a = self.arena.allocator();
         try self.ensure_system_message();
@@ -171,12 +189,66 @@ pub const Harness = struct {
         });
 
         var turn: u32 = 0;
-        while (turn < limits.max_tool_turns) : (turn += 1) {
-            const response = try self.fetch_response(
+        var turn_cap: u32 = limits.max_tool_turns;
+
+        var usage_seen = false;
+        var cumulative_input: u64 = 0;
+        var cumulative_output: u64 = 0;
+        var cumulative_total: u64 = 0;
+        var max_context_input: u64 = 0;
+
+        const context_window = context_window_tokens_for_model(
+            self.model,
+        );
+
+        while (turn < turn_cap) : (turn += 1) {
+            const api_response = try self.fetch_response(
                 a,
                 options,
             );
+            const response = api_response.message;
             try self.messages.append(a, response);
+
+            if (api_response.usage.has_data()) {
+                usage_seen = true;
+                cumulative_input += api_response.usage.input_tokens;
+                cumulative_output += api_response.usage.output_tokens;
+                cumulative_total += if (api_response.usage.total_tokens > 0)
+                    api_response.usage.total_tokens
+                else
+                    api_response.usage.input_tokens +
+                        api_response.usage.output_tokens;
+
+                max_context_input = @max(
+                    max_context_input,
+                    api_response.usage.input_tokens,
+                );
+
+                const context_tenths = context_used_tenths(
+                    max_context_input,
+                    context_window,
+                );
+                const adaptive_cap = dynamic_turn_cap_for_context(
+                    context_tenths,
+                );
+                turn_cap = @min(turn_cap, adaptive_cap);
+            }
+
+            self.last_turn_usage = .{
+                .available = usage_seen,
+                .input_tokens = cumulative_input,
+                .output_tokens = cumulative_output,
+                .total_tokens = if (cumulative_total > 0)
+                    cumulative_total
+                else
+                    (cumulative_input + cumulative_output),
+                .context_window_tokens = context_window,
+                .context_used_tenths_pct = context_used_tenths(
+                    max_context_input,
+                    context_window,
+                ),
+                .dynamic_turn_cap = turn_cap,
+            };
 
             const tool_calls = response.tool_calls orelse {
                 return response.content;
@@ -203,7 +275,7 @@ pub const Harness = struct {
         self: *Harness,
         a: std.mem.Allocator,
         options: SendOptions,
-    ) !types.Message {
+    ) !openrouter.Response {
         if (options.streaming) {
             return openrouter.stream_message(
                 a,
@@ -225,6 +297,43 @@ pub const Harness = struct {
         );
     }
 
+    fn context_window_tokens_for_model(model: []const u8) u64 {
+        if (std.mem.startsWith(u8, model, "anthropic/")) {
+            return 200_000;
+        }
+        if (std.mem.startsWith(u8, model, "openai/gpt-4.1")) {
+            return 1_047_576;
+        }
+        if (std.mem.startsWith(u8, model, "openai/")) {
+            return 128_000;
+        }
+        if (std.mem.startsWith(u8, model, "google/")) {
+            return 1_000_000;
+        }
+        return 200_000;
+    }
+
+    fn context_used_tenths(
+        input_tokens: u64,
+        context_window: u64,
+    ) u16 {
+        if (context_window == 0) return 0;
+        const scaled =
+            (input_tokens * 1000 + context_window / 2) /
+            context_window;
+        return @intCast(@min(scaled, 1000));
+    }
+
+    fn dynamic_turn_cap_for_context(
+        context_used_tenths_pct: u16,
+    ) u32 {
+        if (context_used_tenths_pct >= 990) return 2;
+        if (context_used_tenths_pct >= 960) return 3;
+        if (context_used_tenths_pct >= 920) return 4;
+        if (context_used_tenths_pct >= 850) return 6;
+        return limits.max_tool_turns;
+    }
+
     fn reset_state(self: *Harness) !void {
         self.messages.deinit(self.arena.allocator());
         self.arena.deinit();
@@ -235,6 +344,7 @@ pub const Harness = struct {
         self.messages = std.ArrayList(types.Message).empty;
         self.model = default_model;
         self.mode = .build;
+        self.last_turn_usage = .{};
         try self.rebuild_system_text();
     }
 
