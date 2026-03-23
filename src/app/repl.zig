@@ -136,7 +136,6 @@ fn run_prompt_streaming(
             stdout,
             use_color,
             session.getModel(),
-            session.getMode(),
         );
     }
     _ = try session.send(prompt, .{
@@ -173,7 +172,6 @@ fn run_prompt_buffered(
             stdout,
             use_color,
             session.getModel(),
-            session.getMode(),
         );
     }
     try stdout.writeAll(response);

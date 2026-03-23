@@ -32,11 +32,10 @@ fn log_tool_call(
 
     if (use_color) iface.writeAll(Ansi.dim) catch return;
     iface.print(
-        "tool call: {s} {s}={s}",
+        " ({s} {s}={s}) ",
         .{ name, label, value },
     ) catch return;
     if (use_color) iface.writeAll(Ansi.reset) catch return;
-    iface.writeAll("\n") catch return;
     iface.flush() catch return;
 }
 

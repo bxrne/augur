@@ -94,19 +94,16 @@ pub fn write_prompt(
     }
 }
 
-/// Write the assistant response prefix as "model@mode> ".
+/// Write the assistant response prefix as "model> ".
 pub fn write_assistant_prefix(
     file: std.fs.File,
     use_color: bool,
     model: []const u8,
-    mode: types.Mode,
 ) !void {
     if (use_color) {
         try file.writeAll(Ansi.assistant);
     }
     try file.writeAll(model);
-    try file.writeAll("@");
-    try file.writeAll(types.mode_label(mode));
     if (use_color) {
         try file.writeAll(Ansi.prompt);
     }
