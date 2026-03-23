@@ -1,3 +1,15 @@
+pub const Mode = enum {
+    build,
+    plan,
+};
+
+pub fn mode_label(mode: Mode) []const u8 {
+    return switch (mode) {
+        .build => "build",
+        .plan => "plan",
+    };
+}
+
 pub const ToolCallFunction = struct {
     name: []const u8,
     arguments: []const u8,
