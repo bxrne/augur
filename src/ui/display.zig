@@ -12,9 +12,9 @@ pub const Ansi = struct {
     pub const label = "\x1b[1;37m";
     pub const border = "\x1b[38;5;244m";
     pub const dim = "\x1b[2m";
-    pub const mode_plan = "\x1b[1;34m";
-    pub const mode_build = "\x1b[1;32m";
-    pub const mode_pair = "\x1b[1;35m";
+    pub const mode_plan = "\x1b[1;38;5;75m";
+    pub const mode_build = "\x1b[1;38;5;42m";
+    pub const mode_pair = "\x1b[1;38;5;208m";
 };
 
 /// Write a single coloured status line to stdout.
