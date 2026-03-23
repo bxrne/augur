@@ -30,8 +30,7 @@ pub fn dispatch(
         try display.write_status_line(
             stdout,
             use_color,
-            "Commands: /plan /build /model"
-                ++ " /new /switch /convos /quit /help",
+            "Commands: /plan /build /pair /model" ++ " /new /switch /convos /quit /help",
         );
         return .handled;
     };
@@ -41,6 +40,9 @@ pub fn dispatch(
     }
     if (std.mem.eql(u8, cmd, "build")) {
         return handle_mode(session, stdout, use_color, .build);
+    }
+    if (std.mem.eql(u8, cmd, "pair")) {
+        return handle_mode(session, stdout, use_color, .pair);
     }
     if (std.mem.eql(u8, cmd, "model")) {
         return handle_model(session, &iter, stdout, use_color);
@@ -88,6 +90,7 @@ fn handle_mode(
     const label = switch (mode) {
         .plan => "Mode set to plan.",
         .build => "Mode set to build.",
+        .pair => "Mode set to pair.",
     };
     try display.write_status_line(stdout, use_color, label);
     return .handled;
@@ -138,8 +141,7 @@ fn handle_new(
             try display.write_status_line(
                 stdout,
                 use_color,
-                "Conversation already exists."
-                    ++ " Use /switch <name>.",
+                "Conversation already exists." ++ " Use /switch <name>.",
             );
             return .handled;
         }
@@ -152,8 +154,7 @@ fn handle_new(
     );
     const out = try std.fmt.bufPrint(
         &buf,
-        "Switched to new conversation:"
-            ++ " {s} (loaded {d} messages)",
+        "Switched to new conversation:" ++ " {s} (loaded {d} messages)",
         .{ name, count },
     );
     try display.write_status_line(stdout, use_color, out);
@@ -192,8 +193,7 @@ fn handle_switch(
     );
     const out = try std.fmt.bufPrint(
         &buf,
-        "Switched to conversation:"
-            ++ " {s} (loaded {d} messages)",
+        "Switched to conversation:" ++ " {s} (loaded {d} messages)",
         .{ store.active_name(), count },
     );
     try display.write_status_line(stdout, use_color, out);
@@ -237,8 +237,7 @@ fn handle_init(
     _ = stdout;
     _ = use_color;
     return .{
-        .send_prompt =
-            "Inspect this project (read key files, check " ++
+        .send_prompt = "Inspect this project (read key files, check " ++
             "the directory structure) and create an " ++
             "AGENTS.md in the repository root. It should " ++
             "document: the project purpose, language and " ++
@@ -256,6 +255,7 @@ fn handle_help(
         "Slash commands:",
         "  /plan          - planning mode (no code)",
         "  /build         - build mode (implementation)",
+        "  /pair          - pair mode (direction + code)",
         "  /model         - show current OpenRouter model",
         "  /model <id>    - switch OpenRouter model",
         "  /new [name]    - create + switch conversation",

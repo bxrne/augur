@@ -14,6 +14,7 @@ pub const Ansi = struct {
     pub const dim = "\x1b[2m";
     pub const mode_plan = "\x1b[1;34m";
     pub const mode_build = "\x1b[1;32m";
+    pub const mode_pair = "\x1b[1;35m";
 };
 
 /// Write a single coloured status line to stdout.
@@ -72,6 +73,7 @@ pub fn mode_color(mode: types.Mode) []const u8 {
     return switch (mode) {
         .plan => Ansi.mode_plan,
         .build => Ansi.mode_build,
+        .pair => Ansi.mode_pair,
     };
 }
 

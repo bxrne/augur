@@ -1,12 +1,14 @@
 pub const Mode = enum {
     build,
     plan,
+    pair,
 };
 
 pub fn mode_label(mode: Mode) []const u8 {
     return switch (mode) {
         .build => "build",
         .plan => "plan",
+        .pair => "pair",
     };
 }
 

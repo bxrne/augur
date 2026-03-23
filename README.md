@@ -59,6 +59,7 @@ Inside the REPL:
 
 - `/plan` switches to plan mode (high-level steps, no code).
 - `/build` switches to build mode (implementation + code).
+- `/pair` switches to pair mode (direction-first pair programming + code).
 - `/model` shows the current model.
 - `/model <id>` changes the OpenRouter model.
 - `/new [name]` creates and switches to a new conversation.
@@ -97,7 +98,7 @@ The assistant can call these tools:
 
 - [x] Streamed responses (default)
 - [x] Model choice
-- [x] Plan and Build modes
+- [x] Plan, Build, and Pair modes
 - [x] Conversation persistence + switching
 - [x] SKILLS discovery (`SKILLS.md`, `SKILLS/*/SKILL.md`, `.skills/*/SKILL.md`)
 - [x] Streaming wait indicator before first token
