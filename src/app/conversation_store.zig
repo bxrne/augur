@@ -1,6 +1,6 @@
 /// Persistent conversation storage.
 ///
-/// Conversations are saved as JSON in `zip/conversations.json`
+/// Conversations are saved as JSON in `augur/conversations.json`
 /// and restored on REPL startup. Each conversation holds a
 /// snapshot of its messages, mode, and model.
 const std = @import("std");
@@ -61,8 +61,8 @@ pub const ConversationStore = struct {
     conversations: std.ArrayList(Conversation),
     active_index: usize,
 
-    const directory_path = "zip";
-    const file_path = "zip/conversations.json";
+    const directory_path = "augur";
+    const file_path = "augur/conversations.json";
 
     /// Create a store with a single "default" conversation.
     pub fn init_default(

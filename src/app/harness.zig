@@ -13,7 +13,7 @@ pub const mode_label = types.mode_label;
 pub const default_model = "anthropic/claude-haiku-4.5";
 
 const preamble =
-    "You are zip, a command-line coding assistant." ++
+    "You are augur, a command-line coding assistant." ++
     " You are running in the user's terminal with access" ++
     " to their working directory." ++
     " You have three tools:" ++

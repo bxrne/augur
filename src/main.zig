@@ -1,4 +1,4 @@
-/// Entry point for the zip CLI assistant.
+/// Entry point for the augur CLI assistant.
 const std = @import("std");
 const cli_args = @import("app/cli_args.zig");
 const harness = @import("app/harness.zig");

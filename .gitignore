@@ -17,4 +17,4 @@ bin/
 *.swp
 *~
 .env
-zip
+augur

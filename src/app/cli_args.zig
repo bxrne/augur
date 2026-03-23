@@ -1,4 +1,4 @@
-/// Command-line argument parsing for the zip CLI.
+/// Command-line argument parsing for the augur CLI.
 const std = @import("std");
 const limits = @import("../core/limits.zig");
 
