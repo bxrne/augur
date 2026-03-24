@@ -1,6 +1,8 @@
 /// Built-in tool implementations (read, write, bash, find, grep, tree, diff, git) and their
-/// JSON-schema definitions sent to the model.
+/// JSON-schema definitions sent to the model. Includes mode-based access control and
+/// .env file protection.
 const std = @import("std");
+const types = @import("types.zig");
 
 const max_tool_output_bytes: u32 = 200 * 1024;
 const max_read_file_bytes: u32 = 10 * 1024 * 1024;
@@ -24,11 +26,69 @@ const tools = std.StaticStringMap(ToolFn).initComptime(.{
     .{ "git", &tool_git },
 });
 
-/// Rejects paths that leave the cwd (absolute or `..`) so file tools stay sandboxed
-/// to the user's working tree.
+// Bash command allowlist
+const bash_allowlist = &[_][]const u8{
+    "cat", "ls", "ping", "curl", "sed", "awk", "jq",
+    "zig", "uv", "python", "gcc", "go", "npm", "node", "bun", "pnpm",
+    "podman", "docker", "tail",
+};
+
+/// Returns true if the tool is allowed in the given mode
+fn is_tool_allowed(tool_name: []const u8, mode: types.Mode) bool {
+    return switch (mode) {
+        .plan => std.mem.eql(u8, tool_name, "read") or
+            std.mem.eql(u8, tool_name, "tree"),
+        .pair => std.mem.eql(u8, tool_name, "read") or
+            std.mem.eql(u8, tool_name, "bash") or
+            std.mem.eql(u8, tool_name, "find") or
+            std.mem.eql(u8, tool_name, "grep") or
+            std.mem.eql(u8, tool_name, "diff"),
+        .build => true, // all tools allowed in build mode
+    };
+}
+
+/// Returns true if a bash command should be allowed (checks allowlist and .env access)
+fn is_bash_command_allowed(command: []const u8) bool {
+    // Block any .env access patterns
+    if (std.mem.indexOf(u8, command, ".env") != null) {
+        return false;
+    }
+
+    // Extract the first word (the command being run)
+    var words = std.mem.splitSequence(u8, command, " ");
+    const first_word_opt = words.next();
+    if (first_word_opt == null) return false;
+
+    var first_word = first_word_opt.?;
+
+    // Handle pipes and redirects: extract just the command name
+    // e.g. "cat file.txt | grep pattern" -> first_word = "cat"
+    // "command < file" -> first_word = "command"
+    first_word = std.mem.trim(u8, first_word, "|<>&;");
+
+    // Extract basename from paths (e.g. "/usr/bin/python" -> "python")
+    if (std.mem.lastIndexOf(u8, first_word, "/")) |slash_idx| {
+        first_word = first_word[slash_idx + 1 ..];
+    }
+
+    // Check if command is in allowlist
+    for (bash_allowlist) |allowed| {
+        if (std.mem.eql(u8, first_word, allowed)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/// Rejects paths that leave the cwd (absolute or `..`) or access .env files
+/// so file tools stay sandboxed to the user's working tree.
 fn validate_path(file_path: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, file_path, "/")) return "Refused: absolute paths are not allowed";
     if (std.mem.indexOf(u8, file_path, "..") != null) return "Refused: path traversal is not allowed";
+    if (std.mem.eql(u8, file_path, ".env") or std.mem.endsWith(u8, file_path, "/.env")) {
+        return "Refused: .env files are protected";
+    }
     return null;
 }
 
@@ -45,13 +105,23 @@ fn log_tool_call(name: []const u8, label: []const u8, value: []const u8) void {
     iface.flush() catch return;
 }
 
-/// Dispatch a tool call by name.
+/// Dispatch a tool call by name, with mode-based access control.
 pub fn call_tool(
     name: []const u8,
     args: []const u8,
     allocator: std.mem.Allocator,
+    mode: types.Mode,
 ) ![]u8 {
     std.debug.assert(name.len > 0);
+
+    // Check if tool is allowed in this mode
+    if (!is_tool_allowed(name, mode)) {
+        return std.fmt.allocPrint(
+            allocator,
+            "Tool '{s}' is not available in {s} mode",
+            .{ name, types.mode_label(mode) },
+        );
+    }
 
     const func = tools.get(name) orelse {
         return std.fmt.allocPrint(allocator, "Tool '{s}' not found", .{name});
@@ -75,7 +145,16 @@ const ToolDef = struct {
     params: []const ParamDef,
 };
 
-const tool_defs = [_]ToolDef{
+/// Tool definitions filtered by mode
+fn get_tool_defs(mode: types.Mode) []const ToolDef {
+    return switch (mode) {
+        .plan => &plan_tool_defs,
+        .pair => &pair_tool_defs,
+        .build => &all_tool_defs,
+    };
+}
+
+const all_tool_defs = [_]ToolDef{
     .{
         .name = "read",
         .description = "Read and return the contents of a file",
@@ -148,10 +227,80 @@ const tool_defs = [_]ToolDef{
     },
 };
 
+const plan_tool_defs = [_]ToolDef{
+    .{
+        .name = "read",
+        .description = "Read and return the contents of a file",
+        .params = &.{.{
+            .name = "file_path",
+            .type_name = "string",
+            .description = "The path to the file to read",
+        }},
+    },
+    .{
+        .name = "tree",
+        .description = "Show directory structure as a tree",
+        .params = &.{
+            .{ .name = "path", .type_name = "string", .description = "Root directory (default: current directory)", .required = false },
+            .{ .name = "depth", .type_name = "integer", .description = "Maximum directory depth to show (default: 3)", .required = false },
+            .{ .name = "ignore_patterns", .type_name = "string", .description = "Comma-separated patterns to ignore (default: '.git,node_modules,.zig-cache')", .required = false },
+        },
+    },
+};
+
+const pair_tool_defs = [_]ToolDef{
+    .{
+        .name = "read",
+        .description = "Read and return the contents of a file",
+        .params = &.{.{
+            .name = "file_path",
+            .type_name = "string",
+            .description = "The path to the file to read",
+        }},
+    },
+    .{
+        .name = "bash",
+        .description = "Run a shell command and return stdout/stderr",
+        .params = &.{.{
+            .name = "command",
+            .type_name = "string",
+            .description = "The command to run",
+        }},
+    },
+    .{
+        .name = "find",
+        .description = "Search for files by name or pattern within a directory tree",
+        .params = &.{
+            .{ .name = "pattern", .type_name = "string", .description = "Filename pattern to search for (glob or exact)" },
+            .{ .name = "path", .type_name = "string", .description = "Starting directory (default: current directory)", .required = false },
+            .{ .name = "type", .type_name = "string", .description = "Filter by type: 'file', 'dir', or 'any' (default: any)", .required = false },
+        },
+    },
+    .{
+        .name = "grep",
+        .description = "Search for text patterns within files",
+        .params = &.{
+            .{ .name = "pattern", .type_name = "string", .description = "Regular expression or literal text to search for" },
+            .{ .name = "path", .type_name = "string", .description = "File or directory to search in" },
+            .{ .name = "context_lines", .type_name = "integer", .description = "Number of context lines to show (default: 0)", .required = false },
+        },
+    },
+    .{
+        .name = "diff",
+        .description = "Show differences between two files",
+        .params = &.{
+            .{ .name = "file1", .type_name = "string", .description = "First file path" },
+            .{ .name = "file2", .type_name = "string", .description = "Second file path" },
+            .{ .name = "context_lines", .type_name = "integer", .description = "Number of context lines (default: 3)", .required = false },
+        },
+    },
+};
+
 /// Serializes tool schemas into the request payload shape the provider expects
 /// (`tools` array of function definitions); without this the model cannot call tools.
-pub fn write_tool_definitions(jw: *std.json.Stringify) !void {
-    for (tool_defs) |def| {
+pub fn write_tool_definitions(jw: *std.json.Stringify, mode: types.Mode) !void {
+    const defs = get_tool_defs(mode);
+    for (defs) |def| {
         try jw.beginObject();
         try jw.objectField("type");
         try jw.write("function");
@@ -234,6 +383,12 @@ fn tool_bash(allocator: std.mem.Allocator, args: []const u8) anyerror![]u8 {
 
     const command = parsed.value.command;
     std.debug.assert(command.len > 0);
+
+    // Check if command is allowed
+    if (!is_bash_command_allowed(command)) {
+        return allocator.dupe(u8, "Refused: bash command is not allowed (contains .env access or uses disallowed command)");
+    }
+
     log_tool_call("bash", "command", command);
 
     const result = try std.process.Child.run(.{

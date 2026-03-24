@@ -16,6 +16,7 @@ pub fn stream_message(
     api_key: []const u8,
     base_url: []const u8,
     model: []const u8,
+    mode: types.Mode,
     output_file: ?std.fs.File,
     on_first_stream_delta: ?*const fn (*anyopaque) void,
     on_first_stream_delta_ctx: ?*anyopaque,
@@ -29,6 +30,7 @@ pub fn stream_message(
         allocator,
         messages,
         model,
+        mode,
     );
     defer body_out.deinit();
     const body = body_out.written();
@@ -84,6 +86,7 @@ fn build_request_body(
     allocator: std.mem.Allocator,
     messages: []const types.Message,
     model: []const u8,
+    mode: types.Mode,
 ) !std.io.Writer.Allocating {
     var out: std.io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -116,7 +119,7 @@ fn build_request_body(
 
     try jw.objectField("tools");
     try jw.beginArray();
-    try toolset.write_tool_definitions(&jw);
+    try toolset.write_tool_definitions(&jw, mode);
     try jw.endArray();
 
     try jw.endObject();

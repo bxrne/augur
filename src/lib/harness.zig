@@ -291,6 +291,7 @@ pub const Harness = struct {
                     tc.function.name,
                     tc.function.arguments,
                     a,
+                    self.mode,
                 );
                 try self.messages.append(a, .{
                     .role = .tool,
@@ -319,6 +320,7 @@ pub const Harness = struct {
             self.api_key,
             self.base_url,
             self.model,
+            self.mode,
             options.stream_output,
             options.on_first_stream_delta,
             options.on_first_stream_delta_ctx,
