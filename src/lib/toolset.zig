@@ -1,4 +1,4 @@
-/// Built-in tool implementations (read, write, bash) and their
+/// Built-in tool implementations (read, write, bash, find, grep, tree, diff, git) and their
 /// JSON-schema definitions sent to the model.
 const std = @import("std");
 
@@ -17,6 +17,11 @@ const tools = std.StaticStringMap(ToolFn).initComptime(.{
     .{ "read", &tool_read },
     .{ "write", &tool_write },
     .{ "bash", &tool_bash },
+    .{ "find", &tool_find },
+    .{ "grep", &tool_grep },
+    .{ "tree", &tool_tree },
+    .{ "diff", &tool_diff },
+    .{ "git", &tool_git },
 });
 
 /// Rejects paths that leave the cwd (absolute or `..`) so file tools stay sandboxed
@@ -61,6 +66,7 @@ const ParamDef = struct {
     name: []const u8,
     type_name: []const u8,
     description: []const u8,
+    required: bool = true,
 };
 
 const ToolDef = struct {
@@ -96,6 +102,50 @@ const tool_defs = [_]ToolDef{
             .description = "The command to run",
         }},
     },
+    .{
+        .name = "find",
+        .description = "Search for files by name or pattern within a directory tree",
+        .params = &.{
+            .{ .name = "pattern", .type_name = "string", .description = "Filename pattern to search for (glob or exact)" },
+            .{ .name = "path", .type_name = "string", .description = "Starting directory (default: current directory)", .required = false },
+            .{ .name = "type", .type_name = "string", .description = "Filter by type: 'file', 'dir', or 'any' (default: any)", .required = false },
+        },
+    },
+    .{
+        .name = "grep",
+        .description = "Search for text patterns within files",
+        .params = &.{
+            .{ .name = "pattern", .type_name = "string", .description = "Regular expression or literal text to search for" },
+            .{ .name = "path", .type_name = "string", .description = "File or directory to search in" },
+            .{ .name = "context_lines", .type_name = "integer", .description = "Number of context lines to show (default: 0)", .required = false },
+        },
+    },
+    .{
+        .name = "tree",
+        .description = "Show directory structure as a tree",
+        .params = &.{
+            .{ .name = "path", .type_name = "string", .description = "Root directory (default: current directory)", .required = false },
+            .{ .name = "depth", .type_name = "integer", .description = "Maximum directory depth to show (default: 3)", .required = false },
+            .{ .name = "ignore_patterns", .type_name = "string", .description = "Comma-separated patterns to ignore (default: '.git,node_modules,.zig-cache')", .required = false },
+        },
+    },
+    .{
+        .name = "diff",
+        .description = "Show differences between two files",
+        .params = &.{
+            .{ .name = "file1", .type_name = "string", .description = "First file path" },
+            .{ .name = "file2", .type_name = "string", .description = "Second file path" },
+            .{ .name = "context_lines", .type_name = "integer", .description = "Number of context lines (default: 3)", .required = false },
+        },
+    },
+    .{
+        .name = "git",
+        .description = "Run git operations (log, status, diff, show)",
+        .params = &.{
+            .{ .name = "operation", .type_name = "string", .description = "Git operation: 'log', 'status', 'diff', 'show'" },
+            .{ .name = "args", .type_name = "string", .description = "Additional arguments for the git command (default: '')", .required = false },
+        },
+    },
 };
 
 /// Serializes tool schemas into the request payload shape the provider expects
@@ -129,7 +179,9 @@ pub fn write_tool_definitions(jw: *std.json.Stringify) !void {
         try jw.endObject();
         try jw.objectField("required");
         try jw.beginArray();
-        for (def.params) |p| try jw.write(p.name);
+        for (def.params) |p| {
+            if (p.required) try jw.write(p.name);
+        }
         try jw.endArray();
         try jw.endObject();
         try jw.endObject();
@@ -194,6 +246,204 @@ fn tool_bash(allocator: std.mem.Allocator, args: []const u8) anyerror![]u8 {
     return format_bash_output(allocator, result);
 }
 
+fn tool_find(allocator: std.mem.Allocator, args: []const u8) anyerror![]u8 {
+    const Args = struct {
+        pattern: []const u8,
+        path: ?[]const u8 = null,
+        @"type": ?[]const u8 = null,
+    };
+
+    const parsed = try std.json.parseFromSlice(Args, allocator, args, .{});
+    defer parsed.deinit();
+
+    const pattern = parsed.value.pattern;
+    const path = parsed.value.path orelse ".";
+    const file_type = parsed.value.@"type" orelse "any";
+
+    if (validate_path(path)) |refusal| return allocator.dupe(u8, refusal);
+
+    log_tool_call("find", "pattern", pattern);
+
+    // Build the find command
+    var cmd = std.ArrayList(u8).empty;
+    defer cmd.deinit(allocator);
+
+    try cmd.writer(allocator).print("find {s} -name '{s}'", .{ path, pattern });
+
+    // Add type filter if specified
+    if (!std.mem.eql(u8, file_type, "any")) {
+        if (std.mem.eql(u8, file_type, "file")) {
+            try cmd.writer(allocator).print(" -type f", .{});
+        } else if (std.mem.eql(u8, file_type, "dir")) {
+            try cmd.writer(allocator).print(" -type d", .{});
+        }
+    }
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "bash", "-lc", cmd.items },
+        .max_output_bytes = max_tool_output_bytes,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return format_bash_output(allocator, result);
+}
+
+fn tool_grep(allocator: std.mem.Allocator, args: []const u8) anyerror![]u8 {
+    const Args = struct {
+        pattern: []const u8,
+        path: []const u8,
+        context_lines: ?i32 = null,
+    };
+
+    const parsed = try std.json.parseFromSlice(Args, allocator, args, .{});
+    defer parsed.deinit();
+
+    const pattern = parsed.value.pattern;
+    const path = parsed.value.path;
+    const context = parsed.value.context_lines orelse 0;
+
+    if (validate_path(path)) |refusal| return allocator.dupe(u8, refusal);
+
+    log_tool_call("grep", "pattern", pattern);
+
+    // Build grep command
+    var cmd = std.ArrayList(u8).empty;
+    defer cmd.deinit(allocator);
+
+    if (context > 0) {
+        try cmd.writer(allocator).print("grep -r -n -C {d} '{s}' {s} 2>/dev/null || true", .{ context, pattern, path });
+    } else {
+        try cmd.writer(allocator).print("grep -r -n '{s}' {s} 2>/dev/null || true", .{ pattern, path });
+    }
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "bash", "-lc", cmd.items },
+        .max_output_bytes = max_tool_output_bytes,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return format_bash_output(allocator, result);
+}
+
+fn tool_tree(allocator: std.mem.Allocator, args: []const u8) anyerror![]u8 {
+    const Args = struct {
+        path: ?[]const u8 = null,
+        depth: ?i32 = null,
+        ignore_patterns: ?[]const u8 = null,
+    };
+
+    const parsed = try std.json.parseFromSlice(Args, allocator, args, .{});
+    defer parsed.deinit();
+
+    const path = parsed.value.path orelse ".";
+    const depth = parsed.value.depth orelse 3;
+    const ignore = parsed.value.ignore_patterns orelse ".git,node_modules,.zig-cache";
+
+    if (validate_path(path)) |refusal| return allocator.dupe(u8, refusal);
+
+    log_tool_call("tree", "path", path);
+
+    // Build tree command using find (tree might not be installed)
+    var cmd = std.ArrayList(u8).empty;
+    defer cmd.deinit(allocator);
+
+    try cmd.writer(allocator).print("find {s} -maxdepth {d}", .{ path, depth });
+
+    // Add ignore patterns
+    var ignore_iter = std.mem.splitSequence(u8, ignore, ",");
+    while (ignore_iter.next()) |pattern| {
+        const trimmed = std.mem.trim(u8, pattern, " ");
+        if (trimmed.len > 0) {
+            try cmd.writer(allocator).print(" -not -path '*/{s}/*' -not -path '*/{s}'", .{ trimmed, trimmed });
+        }
+    }
+
+    try cmd.writer(allocator).print(" | sort", .{});
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "bash", "-lc", cmd.items },
+        .max_output_bytes = max_tool_output_bytes,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return format_bash_output(allocator, result);
+}
+
+fn tool_diff(allocator: std.mem.Allocator, args: []const u8) anyerror![]u8 {
+    const Args = struct {
+        file1: []const u8,
+        file2: []const u8,
+        context_lines: ?i32 = null,
+    };
+
+    const parsed = try std.json.parseFromSlice(Args, allocator, args, .{});
+    defer parsed.deinit();
+
+    const file1 = parsed.value.file1;
+    const file2 = parsed.value.file2;
+    const context = parsed.value.context_lines orelse 3;
+
+    if (validate_path(file1)) |refusal| return allocator.dupe(u8, refusal);
+    if (validate_path(file2)) |refusal| return allocator.dupe(u8, refusal);
+
+    log_tool_call("diff", "files", file1);
+
+    var cmd = std.ArrayList(u8).empty;
+    defer cmd.deinit(allocator);
+
+    try cmd.writer(allocator).print("diff -u -U {d} '{s}' '{s}' 2>/dev/null || true", .{ context, file1, file2 });
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "bash", "-lc", cmd.items },
+        .max_output_bytes = max_tool_output_bytes,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return format_bash_output(allocator, result);
+}
+
+fn tool_git(allocator: std.mem.Allocator, args: []const u8) anyerror![]u8 {
+    const Args = struct {
+        operation: []const u8,
+        args: ?[]const u8 = null,
+    };
+
+    const parsed = try std.json.parseFromSlice(Args, allocator, args, .{});
+    defer parsed.deinit();
+
+    const operation = parsed.value.operation;
+    const git_args = parsed.value.args orelse "";
+
+    // Validate operation is one of the allowed ones
+    if (!std.mem.eql(u8, operation, "log") and
+        !std.mem.eql(u8, operation, "status") and
+        !std.mem.eql(u8, operation, "diff") and
+        !std.mem.eql(u8, operation, "show"))
+    {
+        return std.fmt.allocPrint(allocator, "Unsupported git operation '{s}'. Allowed: log, status, diff, show", .{operation});
+    }
+
+    log_tool_call("git", "operation", operation);
+
+    var cmd = std.ArrayList(u8).empty;
+    defer cmd.deinit(allocator);
+
+    try cmd.writer(allocator).print("git {s} {s} 2>&1 || echo 'git command failed'", .{ operation, git_args });
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "bash", "-lc", cmd.items },
+        .max_output_bytes = max_tool_output_bytes,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return format_bash_output(allocator, result);
+}
+
 /// Concatenates stdout and stderr for the model; appends exit code only on failure
 /// so success stays clean while errors still carry diagnostics.
 fn format_bash_output(allocator: std.mem.Allocator, result: std.process.Child.RunResult) ![]u8 {
@@ -211,8 +461,7 @@ fn format_bash_output(allocator: std.mem.Allocator, result: std.process.Child.Ru
         .Signal, .Stopped, .Unknown => 1,
     };
 
-    if (exit_code != 0) {
-        if (output.items.len > 0) try output.appendSlice(allocator, "\n");
+    if (exit_code != 0 and output.items.len == 0) {
         try output.writer(allocator).print("exit code: {d}", .{exit_code});
     }
 
