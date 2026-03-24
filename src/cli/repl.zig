@@ -27,15 +27,13 @@ pub fn run(
 ) !void {
     const stdin = std.fs.File.stdin().deprecatedReader();
 
-    var store = try conversation.ConversationStore.load_or_init(
+    var store = try conversation.ConversationStore.load_history(
         allocator,
     );
     defer store.deinit();
 
+    _ = try store.new_branch_session(session.get_model());
     try store.apply_active(session);
-
-    try session.set_mode(.plan);
-    try store.sync_active_from_session(session);
     try store.save();
 
     while (true) {

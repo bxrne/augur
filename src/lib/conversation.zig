@@ -1,11 +1,43 @@
 //! Persists named chat sessions to `augur/conversations.json` and keeps the harness
-//! in sync when switching or creating conversations.
+//! in sync when switching or creating conversations.  Each run creates a fresh
+//! conversation named `<branch>-<N>` so every session starts with a clean context window.
 const std = @import("std");
 const types = @import("types.zig");
 const harness = @import("harness.zig");
 
-const max_conversation_name_attempts: u32 = 4096;
 const max_conversations_file_bytes: u32 = 32 * 1024 * 1024;
+
+/// Determine the current git branch from `.git/HEAD`.
+/// Slashes in branch names become dashes for clean conversation names.
+/// Returns "unknown" when git metadata is unreadable (not a repo, etc.).
+fn detect_branch(allocator: std.mem.Allocator) ![]const u8 {
+    const cwd = std.fs.cwd();
+    const head_bytes = cwd.readFileAlloc(
+        allocator,
+        ".git/HEAD",
+        4096,
+    ) catch {
+        return try allocator.dupe(u8, "unknown");
+    };
+    defer allocator.free(head_bytes);
+
+    const trimmed = std.mem.trimRight(u8, head_bytes, "\r\n \t");
+    const ref_prefix = "ref: refs/heads/";
+
+    const raw = if (std.mem.startsWith(u8, trimmed, ref_prefix) and
+        trimmed.len > ref_prefix.len)
+        trimmed[ref_prefix.len..]
+    else if (trimmed.len >= 8)
+        trimmed[0..8]
+    else
+        "unknown";
+
+    const result = try allocator.dupe(u8, raw);
+    for (result) |*c| {
+        if (c.* == '/') c.* = '-';
+    }
+    return result;
+}
 
 /// One conversation's serialised shape in JSON: metadata plus a cloned message list.
 const ConversationSnapshot = struct {
@@ -65,34 +97,9 @@ pub const ConversationStore = struct {
     const directory_path = "augur";
     const file_path = "augur/conversations.json";
 
-    /// Create a store with a single "default" conversation.
-    pub fn init_default(
-        allocator: std.mem.Allocator,
-    ) !ConversationStore {
-        var conversations = std.ArrayList(Conversation).empty;
-        errdefer conversations.deinit(allocator);
-
-        var default = try Conversation.init(
-            allocator,
-            "default",
-            .plan,
-            harness.default_model,
-        );
-        errdefer default.deinit(allocator);
-
-        try conversations.append(allocator, default);
-
-        const store = ConversationStore{
-            .allocator = allocator,
-            .conversations = conversations,
-            .active_index = 0,
-        };
-        std.debug.assert(store.conversations.items.len > 0);
-        return store;
-    }
-
-    /// Load from disk, falling back to a default store.
-    pub fn load_or_init(
+    /// Load conversation history from disk, returning an empty store when
+    /// no file exists.  Pair with `new_branch_session` to start a clean run.
+    pub fn load_history(
         allocator: std.mem.Allocator,
     ) !ConversationStore {
         const cwd = std.fs.cwd();
@@ -103,7 +110,11 @@ pub const ConversationStore = struct {
             file_path,
             max_conversations_file_bytes,
         ) catch |err| switch (err) {
-            error.FileNotFound => return init_default(allocator),
+            error.FileNotFound => return .{
+                .allocator = allocator,
+                .conversations = .empty,
+                .active_index = 0,
+            },
             else => return err,
         };
         defer allocator.free(contents);
@@ -116,6 +127,14 @@ pub const ConversationStore = struct {
         );
         defer parsed.deinit();
 
+        if (parsed.value.conversations.len == 0) {
+            return .{
+                .allocator = allocator,
+                .conversations = .empty,
+                .active_index = 0,
+            };
+        }
+
         return from_snapshot(allocator, parsed.value);
     }
 
@@ -124,7 +143,11 @@ pub const ConversationStore = struct {
         snapshot: ConversationsFile,
     ) !ConversationStore {
         if (snapshot.conversations.len == 0) {
-            return init_default(allocator);
+            return .{
+                .allocator = allocator,
+                .conversations = .empty,
+                .active_index = 0,
+            };
         }
 
         var store = ConversationStore{
@@ -341,31 +364,70 @@ pub const ConversationStore = struct {
         return self.active_name();
     }
 
-    /// Picks `chat-{n}` starting from `len+1`, bumping `n` until unused so auto names
-    /// never collide with existing conversations.
+    /// Auto-name using the current git branch: `<branch>-<N>`.
     fn generate_name(
         self: *const ConversationStore,
     ) ![]const u8 {
-        var suffix: u32 = @intCast(
-            self.conversations.items.len + 1,
+        const branch = try detect_branch(self.allocator);
+        defer self.allocator.free(branch);
+
+        const index = self.next_branch_index(branch);
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "{s}-{d}",
+            .{ branch, index },
         );
-        var attempt: u32 = 0;
+    }
 
-        while (attempt < max_conversation_name_attempts) {
-            const name = try std.fmt.allocPrint(
-                self.allocator,
-                "chat-{d}",
-                .{suffix},
-            );
-            if (self.find_index_by_name(name) == null) {
-                return name;
-            }
-            self.allocator.free(name);
-            suffix += 1;
-            attempt += 1;
+    /// Scan existing conversations for `<branch>-N` names and return the
+    /// next unused index.
+    fn next_branch_index(
+        self: *const ConversationStore,
+        branch: []const u8,
+    ) u32 {
+        var max_seen: ?u32 = null;
+        for (self.conversations.items) |conv| {
+            if (conv.name.len <= branch.len + 1) continue;
+            if (!std.mem.startsWith(u8, conv.name, branch)) continue;
+            if (conv.name[branch.len] != '-') continue;
+
+            const suffix = conv.name[branch.len + 1 ..];
+            const n = std.fmt.parseInt(u32, suffix, 10) catch continue;
+            max_seen = if (max_seen) |m| @max(m, n) else n;
         }
+        return if (max_seen) |m| m + 1 else 0;
+    }
 
-        return error.ConversationNameExhausted;
+    /// Create a fresh `<branch>-<N>` conversation and make it active.
+    /// Does not sync from the harness — use at startup for a guaranteed
+    /// clean context window.
+    pub fn new_branch_session(
+        self: *ConversationStore,
+        model: []const u8,
+    ) ![]const u8 {
+        const branch = try detect_branch(self.allocator);
+        defer self.allocator.free(branch);
+
+        const index = self.next_branch_index(branch);
+        const name = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}-{d}",
+            .{ branch, index },
+        );
+        defer self.allocator.free(name);
+
+        var conv = try Conversation.init(
+            self.allocator,
+            name,
+            .plan,
+            model,
+        );
+        errdefer conv.deinit(self.allocator);
+
+        try self.conversations.append(self.allocator, conv);
+        self.active_index = self.conversations.items.len - 1;
+
+        return self.active_name();
     }
 
     fn find_index_by_name(
@@ -421,11 +483,45 @@ test "Conversation init and deinit" {
     try std.testing.expectEqual(@as(usize, 0), conv.messages.items.len);
 }
 
-test "ConversationStore init_default" {
-    const allocator = std.testing.allocator;
-    var store = try ConversationStore.init_default(allocator);
+test "next_branch_index returns 0 when no conversations exist" {
+    var store = ConversationStore{
+        .allocator = std.testing.allocator,
+        .conversations = .empty,
+        .active_index = 0,
+    };
     defer store.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), store.conversations.items.len);
-    try std.testing.expectEqualStrings("default", store.active_name());
+    try std.testing.expectEqual(@as(u32, 0), store.next_branch_index("main"));
+}
+
+test "next_branch_index increments past highest existing index" {
+    const allocator = std.testing.allocator;
+    var store = ConversationStore{
+        .allocator = allocator,
+        .conversations = .empty,
+        .active_index = 0,
+    };
+    defer store.deinit();
+
+    const c0 = try Conversation.init(allocator, "main-0", .plan, "m");
+    try store.conversations.append(allocator, c0);
+    const c1 = try Conversation.init(allocator, "main-2", .plan, "m");
+    try store.conversations.append(allocator, c1);
+
+    try std.testing.expectEqual(@as(u32, 3), store.next_branch_index("main"));
+}
+
+test "next_branch_index ignores other branches" {
+    const allocator = std.testing.allocator;
+    var store = ConversationStore{
+        .allocator = allocator,
+        .conversations = .empty,
+        .active_index = 0,
+    };
+    defer store.deinit();
+
+    const c0 = try Conversation.init(allocator, "feature-0", .plan, "m");
+    try store.conversations.append(allocator, c0);
+
+    try std.testing.expectEqual(@as(u32, 0), store.next_branch_index("main"));
 }
